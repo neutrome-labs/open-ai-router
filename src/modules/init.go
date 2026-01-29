@@ -19,6 +19,7 @@ func init() {
 	plugin.RegisterPlugin("models", &flow.Models{})
 	plugin.RegisterPlugin("parallel", &flow.Parallel{})
 	plugin.RegisterPlugin("fuzz", &flow.Fuzz{})
+	plugin.RegisterPlugin("swarm", &flow.Swarm{})
 	plugin.RegisterPlugin("stools", &plugins.StripTools{})
 	plugin.RegisterPlugin("zip", &plugins.Zip{})
 
