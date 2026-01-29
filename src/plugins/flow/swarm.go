@@ -64,11 +64,8 @@ func (s *Swarm) RecursiveHandler(
 		return false, nil
 	}
 
-	// Check if streaming - swarm doesn't support streaming
+	// Check if streaming is requested - we'll stream the synthesis phase
 	stream := styles.TryGetFromPartialJSON[bool](reqJson, "stream")
-	if stream {
-		plugins.Logger.Warn("swarm plugin: streaming not supported, processing as non-streaming")
-	}
 
 	// Extract base model (remove plugin suffix)
 	baseModel := extractBaseModel(originalModel)
@@ -102,20 +99,30 @@ func (s *Swarm) RecursiveHandler(
 		zap.Int("completed_tasks", len(results)))
 
 	// === PHASE 3: Mother Agent Result Synthesis ===
-	finalResponse, err := s.synthesizeResults(invoker, r, reqJson, baseModel, messages, tasks, results)
-	if err != nil {
-		plugins.Logger.Error("swarm plugin: result synthesis failed", zap.Error(err))
-		return false, nil
-	}
+	if stream {
+		// Streaming: pass through SSE directly to client
+		err = s.synthesizeResultsStreaming(invoker, r, reqJson, baseModel, messages, tasks, results, w)
+		if err != nil {
+			plugins.Logger.Error("swarm plugin: streaming synthesis failed", zap.Error(err))
+			return true, err
+		}
+	} else {
+		// Non-streaming: capture and return JSON
+		finalResponse, err := s.synthesizeResults(invoker, r, reqJson, baseModel, messages, tasks, results)
+		if err != nil {
+			plugins.Logger.Error("swarm plugin: result synthesis failed", zap.Error(err))
+			return false, nil
+		}
 
-	// Write the final synthesized response
-	w.Header().Set("Content-Type", "application/json")
-	respData, err := finalResponse.Marshal()
-	if err != nil {
-		plugins.Logger.Error("swarm plugin: failed to marshal final response", zap.Error(err))
-		return true, err
+		// Write the final synthesized response
+		w.Header().Set("Content-Type", "application/json")
+		respData, err := finalResponse.Marshal()
+		if err != nil {
+			plugins.Logger.Error("swarm plugin: failed to marshal final response", zap.Error(err))
+			return true, err
+		}
+		w.Write(respData)
 	}
-	w.Write(respData)
 
 	plugins.Logger.Info("swarm plugin: orchestration complete")
 	return true, nil
@@ -417,6 +424,83 @@ Provide your synthesized response directly. Do not mention the swarm process unl
 	}
 
 	return respJson, nil
+}
+
+// synthesizeResultsStreaming uses the mother agent to synthesize results and streams directly to client
+func (s *Swarm) synthesizeResultsStreaming(
+	invoker plugin.HandlerInvoker,
+	r *http.Request,
+	reqJson styles.PartialJSON,
+	model string,
+	originalMessages []styles.ChatCompletionsMessage,
+	tasks []SwarmTask,
+	results []SwarmResult,
+	w http.ResponseWriter,
+) error {
+	// Build synthesis prompt (same as non-streaming)
+	synthesisPrompt := `You are the Swarm Orchestrator (Mother Agent). Your role is to synthesize the results from multiple worker agents into a coherent, comprehensive final response.
+
+TASKS AND RESULTS:
+`
+
+	for _, result := range results {
+		taskDesc := ""
+		for _, t := range tasks {
+			if t.ID == result.TaskID {
+				taskDesc = t.Description
+				break
+			}
+		}
+		synthesisPrompt += fmt.Sprintf("\n--- Task: %s ---\nDescription: %s\nResult: %s\nComplete: %v\n",
+			result.TaskID, taskDesc, result.Output, result.Complete)
+	}
+
+	synthesisPrompt += `
+
+INSTRUCTIONS:
+1. Analyze all worker results carefully
+2. Integrate the findings into a coherent response
+3. Resolve any contradictions or inconsistencies
+4. Provide a comprehensive answer that addresses the original request
+5. If tasks failed, note what information is missing
+6. Maintain the tone and style appropriate to the original request
+
+Provide your synthesized response directly. Do not mention the swarm process unless relevant to the answer.`
+
+	// Build synthesis messages
+	var synthesisMessages []styles.ChatCompletionsMessage
+	synthesisMessages = append(synthesisMessages, styles.ChatCompletionsMessage{
+		Role:    "system",
+		Content: synthesisPrompt,
+	})
+
+	originalUserPrompt := buildUserPromptForDecomposition(originalMessages)
+	synthesisMessages = append(synthesisMessages, styles.ChatCompletionsMessage{
+		Role:    "user",
+		Content: "Original request: " + originalUserPrompt + "\n\nPlease provide the final synthesized response based on the worker results above.",
+	})
+
+	synthesisReq, err := reqJson.CloneWith("messages", synthesisMessages)
+	if err != nil {
+		return err
+	}
+
+	synthesisReq, _ = synthesisReq.CloneWith("model", model)
+	// Keep stream=true for streaming synthesis
+	synthesisReq, _ = synthesisReq.CloneWith("stream", true)
+
+	reqData, err := synthesisReq.Marshal()
+	if err != nil {
+		return err
+	}
+
+	clonedReq := r.Clone(r.Context())
+	clonedReq.Body = io.NopCloser(strings.NewReader(string(reqData)))
+
+	plugins.Logger.Debug("swarm plugin: calling mother agent for streaming synthesis")
+
+	// InvokeHandler writes directly to w, passing through SSE
+	return invoker.InvokeHandler(w, clonedReq)
 }
 
 // Helper functions
