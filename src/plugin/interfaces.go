@@ -1,13 +1,12 @@
-// Package plugins provides the v3 plugin system for chat completions.
-// V3 upgrade: Plugins have separate methods for streaming vs non-streaming,
-// plus StreamEnd handlers for finalizing when no usage data is available in stream.
+// Package plugin provides the AIL-based plugin system for AI routing.
+// Plugins operate on *ail.Program, the universal intermediate representation.
 package plugin
 
 import (
 	"net/http"
 
+	"github.com/neutrome-labs/ail"
 	"github.com/neutrome-labs/open-ai-router/src/services"
-	"github.com/neutrome-labs/open-ai-router/src/styles"
 	"go.uber.org/zap"
 )
 
@@ -32,84 +31,90 @@ func ContextUserID() contextKey { return userIDKey }
 // ContextKeyID returns the key ID context key
 func ContextKeyID() contextKey { return keyIDKey }
 
-// Plugin is the base interface for all chat completion plugins
+// Plugin is the base interface for all plugins
 type Plugin interface {
 	// Name returns the plugin's identifier
 	Name() string
 }
 
-// HandlerInvoker allows plugins to invoke the outer handler recursively.
-// This is used by plugins like "models" (fallback) and "parallel" (fan-out).
-type HandlerInvoker interface {
-	// InvokeHandler invokes the outer handler with the given request.
-	// The request should already have the model set appropriately.
-	// Returns nil on success, error on failure.
-	InvokeHandler(w http.ResponseWriter, r *http.Request) error
-
-	// InvokeHandlerCapture invokes the handler and captures the response instead of writing to w.
-	// Used by parallel plugin to capture multiple responses for merging.
-	// Returns the captured response on success, or error on failure.
-	InvokeHandlerCapture(r *http.Request) (styles.PartialJSON, error)
+// ModelRewritePlugin can rewrite the model name before plugin resolution.
+// Used by virtual providers for model aliasing. Runs in a loop until the
+// model stabilises, so chained virtual→virtual mappings work naturally.
+type ModelRewritePlugin interface {
+	Plugin
+	// RewriteModel returns the rewritten model and true if it matched,
+	// or the original model and false if it didn't.
+	RewriteModel(model string) (rewritten string, matched bool)
 }
 
-// BeforePlugin processes requests before sending to provider
+// BeforePlugin processes requests before sending to provider.
+// Operates on the AIL program representation.
 type BeforePlugin interface {
 	Plugin
-	// Before is called before the request is sent to the provider
-	// Returns the modified request body
-	Before(params string, p *services.ProviderService, r *http.Request, reqJson styles.PartialJSON) (styles.PartialJSON, error)
+	// Before is called before the request is sent to the provider.
+	// Returns the (possibly modified) program.
+	Before(params string, p *services.ProviderService, r *http.Request, prog *ail.Program) (*ail.Program, error)
 }
 
-// AfterPlugin processes non-streaming responses
+// AfterPlugin processes non-streaming responses.
 type AfterPlugin interface {
 	Plugin
-	// After is called after receiving a complete (non-streaming) response
-	After(params string, p *services.ProviderService, r *http.Request, reqJson styles.PartialJSON, res *http.Response, resJson styles.PartialJSON) (styles.PartialJSON, error)
+	// After is called after receiving a complete (non-streaming) response.
+	After(params string, p *services.ProviderService, r *http.Request, reqProg *ail.Program, res *http.Response, resProg *ail.Program) (*ail.Program, error)
 }
 
-// StreamChunkPlugin processes individual streaming chunks
+// StreamChunkPlugin processes individual streaming chunks.
 type StreamChunkPlugin interface {
 	Plugin
-	// AfterChunk is called for each streaming chunk
-	AfterChunk(params string, p *services.ProviderService, r *http.Request, reqJson styles.PartialJSON, res *http.Response, chunk styles.PartialJSON) (styles.PartialJSON, error)
+	// AfterChunk is called for each streaming chunk (as an AIL program fragment).
+	AfterChunk(params string, p *services.ProviderService, r *http.Request, reqProg *ail.Program, res *http.Response, chunk *ail.Program) (*ail.Program, error)
 }
 
-// StreamEndPlugin handles stream completion, useful for finalization when no usage data in stream
+// StreamEndPlugin handles stream completion.
 type StreamEndPlugin interface {
 	Plugin
-	// StreamEnd is called when the stream completes
-	// lastChunk may be nil if no chunks were received or the last chunk had no usage
-	// This allows plugins to finalize state, compute estimated usage, etc.
-	StreamEnd(params string, p *services.ProviderService, r *http.Request, reqJson styles.PartialJSON, res *http.Response, lastChunk styles.PartialJSON) error
+	// StreamEnd is called when the stream completes.
+	StreamEnd(params string, p *services.ProviderService, r *http.Request, reqProg *ail.Program, res *http.Response, lastChunk *ail.Program) error
 }
 
-// ErrorPlugin handles errors from provider calls
+// ErrorPlugin handles errors from provider calls.
 type ErrorPlugin interface {
 	Plugin
-	// OnError is called when a provider call fails
-	// res may be nil if the error occurred before receiving a response
-	// providerErr is the error returned by the provider
-	OnError(params string, p *services.ProviderService, r *http.Request, reqJson styles.PartialJSON, res *http.Response, providerErr error) error
+	// OnError is called when a provider call fails.
+	OnError(params string, p *services.ProviderService, r *http.Request, reqProg *ail.Program, res *http.Response, providerErr error) error
+}
+
+// HandlerInvoker allows plugins to invoke the outer handler recursively.
+// Used by plugins like fallback (retry with different providers) and parallel (fan-out).
+type HandlerInvoker interface {
+	// InvokeHandler invokes the outer handler with the given AIL program.
+	InvokeHandler(prog *ail.Program, w http.ResponseWriter, r *http.Request) error
+
+	// InvokeHandlerCapture invokes the handler and captures the response as an AIL program.
+	InvokeHandlerCapture(prog *ail.Program, r *http.Request) (*ail.Program, error)
 }
 
 // RecursiveHandlerPlugin can intercept the request flow and invoke the handler recursively.
-// This is used for plugins that need to make multiple calls (fallback, parallel, etc.).
-// When RecursiveHandler returns handled=true, the module should not proceed with normal flow.
+// Used for plugins that need to make multiple calls (fallback, parallel, etc.).
 type RecursiveHandlerPlugin interface {
 	Plugin
 	// RecursiveHandler is called before normal provider iteration.
-	// If handled is true, the plugin has handled the request (either success or error).
-	// If handled is false, normal provider iteration should proceed.
+	// If handled is true, the plugin has handled the request.
 	RecursiveHandler(
 		params string,
 		invoker HandlerInvoker,
-		reqJson styles.PartialJSON,
+		prog *ail.Program,
 		w http.ResponseWriter,
 		r *http.Request,
 	) (handled bool, err error)
 }
 
-// PluginInstance represents a plugin with its parameters
+// ProviderLister returns all provisioned provider services.
+// Set by the router module during Provision so that plugins
+// like fuzz can discover providers without importing modules.
+var ProviderLister func() []*services.ProviderService
+
+// PluginInstance represents a plugin with its parameters.
 type PluginInstance struct {
 	Plugin Plugin
 	Params string

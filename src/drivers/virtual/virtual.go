@@ -1,26 +1,23 @@
 // Package virtual provides a virtual driver for model aliasing and presets.
-// Virtual providers don't connect to external APIs - they delegate to other
-// providers via the recursive handler plugin pattern, allowing named model presets.
+// Virtual providers don't connect to external APIs — they rewrite the model
+// name so the request is routed to a real provider.
 package virtual
 
 import (
-	"bytes"
-	"io"
 	"net/http"
 	"strings"
 
 	"github.com/neutrome-labs/open-ai-router/src/drivers"
-	"github.com/neutrome-labs/open-ai-router/src/plugin"
 	"github.com/neutrome-labs/open-ai-router/src/services"
-	"github.com/neutrome-labs/open-ai-router/src/styles"
 	"go.uber.org/zap"
 )
 
 // Logger for virtual driver - can be set by modules
 var Logger *zap.Logger = zap.NewNop()
 
-// VirtualPlugin implements RecursiveHandlerPlugin for virtual providers.
-// It intercepts requests for virtual models and redirects them to real providers.
+// VirtualPlugin implements ModelRewritePlugin for virtual providers.
+// It rewrites virtual model names to their real targets before plugin
+// resolution and provider routing.
 type VirtualPlugin struct {
 	// ProviderName is the name of this virtual provider
 	ProviderName string
@@ -33,92 +30,48 @@ func (v *VirtualPlugin) Name() string {
 	return "virtual:" + v.ProviderName
 }
 
-// RecursiveHandler intercepts requests for virtual models and redirects them.
-func (v *VirtualPlugin) RecursiveHandler(
-	params string,
-	invoker plugin.HandlerInvoker,
-	reqJson styles.PartialJSON,
-	w http.ResponseWriter,
-	r *http.Request,
-) (handled bool, err error) {
-	modelName := styles.TryGetFromPartialJSON[string](reqJson, "model")
-
-	// Check if this is targeting our virtual provider
-	// Format: "virtualProvider/modelName" or "virtualProvider/modelName+plugins"
-	providerPrefix := ""
-	actualModel := modelName
-	if idx := strings.Index(modelName, "/"); idx >= 0 {
-		providerPrefix = strings.ToLower(modelName[:idx])
-		actualModel = modelName[idx+1:]
+// RewriteModel checks whether the model targets this virtual provider and,
+// if so, returns the mapped real model (preserving any user plugin suffixes).
+func (v *VirtualPlugin) RewriteModel(model string) (string, bool) {
+	// Expect "virtualProvider/modelName" or "virtualProvider/modelName+plugins"
+	idx := strings.Index(model, "/")
+	if idx < 0 {
+		return model, false
 	}
+	providerPrefix := strings.ToLower(model[:idx])
+	actualModel := model[idx+1:]
 
-	// Only handle if explicitly targeting this virtual provider
 	if providerPrefix != v.ProviderName {
-		return false, nil
+		return model, false
 	}
 
-	// Extract plugin suffix from the model name (e.g., "model+plugin1:arg+plugin2" -> "model", "+plugin1:arg+plugin2")
+	// Split base model from user plugin suffix
 	baseModel := actualModel
 	pluginSuffix := ""
 	if plusIdx := strings.IndexByte(actualModel, '+'); plusIdx >= 0 {
 		baseModel = actualModel[:plusIdx]
-		pluginSuffix = actualModel[plusIdx:] // includes the leading '+'
+		pluginSuffix = actualModel[plusIdx:] // includes leading '+'
 	}
 
-	// Look up the target model for this virtual model (using base model without plugins)
 	targetModel, ok := v.ModelMappings[baseModel]
 	if !ok || targetModel == "" {
-		return false, nil // Model not in our mappings, let normal flow handle it
+		return model, false
 	}
 
-	// Merge plugins: target plugins come first, then user plugins
-	// Example: target="openai/gpt-4+logger", user suffix="+skill:kitty"
-	// Result: "openai/gpt-4+logger+skill:kitty"
+	// Target plugins come first, then user plugins
 	finalModel := targetModel + pluginSuffix
 
-	Logger.Debug("VirtualPlugin handling request",
+	Logger.Debug("VirtualPlugin resolved model",
 		zap.String("provider", v.ProviderName),
-		zap.String("virtual_model", baseModel),
-		zap.String("user_plugins", pluginSuffix),
-		zap.String("target_model", targetModel),
-		zap.String("final_model", finalModel))
+		zap.String("from", model),
+		zap.String("to", finalModel))
 
-	// Rewrite model in request to the target with merged plugins
-	err = reqJson.Set("model", finalModel)
-	if err != nil {
-		return true, err
-	}
-
-	// Marshal the modified request back to JSON
-	newReqBody, err := reqJson.Marshal()
-	if err != nil {
-		return true, err
-	}
-
-	// Create a new request with the rewritten body
-	newReq := r.Clone(r.Context())
-	newReq.Body = io.NopCloser(bytes.NewReader(newReqBody))
-	newReq.ContentLength = int64(len(newReqBody))
-
-	// Invoke the handler - this will write directly to w for streaming
-	err = invoker.InvokeHandler(w, newReq)
-	if err != nil {
-		Logger.Error("VirtualPlugin target failed",
-			zap.String("target", targetModel),
-			zap.Error(err))
-		return true, err
-	}
-
-	Logger.Debug("VirtualPlugin succeeded", zap.String("target", targetModel))
-	return true, nil
+	return finalModel, true
 }
 
 // VirtualListModels implements ListModelsCommand for virtual providers.
-// It returns the configured virtual model names.
 type VirtualListModels struct {
-	// ProviderName is the name of the virtual provider
-	ProviderName string
-	// ModelMappings contains the virtual model names
+	ProviderName  string
 	ModelMappings map[string]string
 }
 

@@ -252,6 +252,19 @@ func (m *RouterModule) Provision(ctx caddy.Context) error {
 			zap.String("style", string(providerStyle)))
 	}
 
+	// Expose providers to plugins (fuzz, etc.) without circular imports.
+	plugin.ProviderLister = func() []*services.ProviderService {
+		m.Impl.Mu.RLock()
+		defer m.Impl.Mu.RUnlock()
+		var out []*services.ProviderService
+		for _, name := range m.ProvidersOrder {
+			if p, ok := m.ProviderConfigs[name]; ok {
+				out = append(out, &p.Impl)
+			}
+		}
+		return out
+	}
+
 	RegisterRouter(m.Name, m)
 	return nil
 }

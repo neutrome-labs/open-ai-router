@@ -1,33 +1,52 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/google/uuid"
+	"github.com/neutrome-labs/ail"
 	"github.com/neutrome-labs/open-ai-router/src/drivers"
 	"github.com/neutrome-labs/open-ai-router/src/drivers/openai"
 	"github.com/neutrome-labs/open-ai-router/src/drivers/virtual"
 	"github.com/neutrome-labs/open-ai-router/src/modules"
 	"github.com/neutrome-labs/open-ai-router/src/plugin"
-	"github.com/neutrome-labs/open-ai-router/src/plugins"
-	"github.com/neutrome-labs/open-ai-router/src/services"
+
 	"github.com/neutrome-labs/open-ai-router/src/sse"
-	"github.com/neutrome-labs/open-ai-router/src/styles"
 	"go.uber.org/zap"
 )
 
+// sampleAILDir is the directory to dump AIL programs into.
+// Set via the SAMPLE_AIL environment variable at startup.
+var sampleAILDir = os.Getenv("SAMPLE_AIL")
+
+// ctxKeySampleHash is the context key for the request sample hash (used to pair response samples).
+type sampleHashKey struct{}
+
+var ctxKeySampleHash = sampleHashKey{}
+
 // ChatCompletionsModule handles OpenAI-style chat completions requests.
-// V3 upgrade: Supports passthrough when input/output styles match, minimizes serialization.
+// AIL rework: all data passes through *ail.Program, no more styles.PartialJSON.
 type ChatCompletionsModule struct {
 	RouterName string `json:"router,omitempty"`
 	logger     *zap.Logger
 }
+
+// requestParser parses incoming Chat Completions requests into AIL
+var requestParser = &ail.ChatCompletionsParser{}
+
+// responseEmitter emits AIL programs as Chat Completions JSON for the client
+var responseEmitter = &ail.ChatCompletionsEmitter{}
 
 func ParseChatCompletionsModule(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var m ChatCompletionsModule
@@ -57,64 +76,48 @@ func (*ChatCompletionsModule) CaddyModule() caddy.ModuleInfo {
 func (m *ChatCompletionsModule) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger(m)
 
-	// Provision package-level loggers for all subsystems
+	// Provision package-level loggers
 	plugin.Logger = m.logger.Named("plugin")
-	plugins.Logger = m.logger.Named("plugins")
-	styles.Logger = m.logger.Named("styles")
 	openai.Logger = m.logger.Named("openai")
 	virtual.Logger = m.logger.Named("virtual")
 
 	return nil
 }
 
+// serveChatCompletions handles non-streaming inference.
 func (m *ChatCompletionsModule) serveChatCompletions(
 	p *modules.ProviderConfig,
 	cmd drivers.InferenceCommand,
 	chain *plugin.PluginChain,
-	reqJson styles.PartialJSON,
+	prog *ail.Program,
 	w http.ResponseWriter,
 	r *http.Request,
 ) error {
-	inputStyle := styles.StyleChatCompletions
-	outputStyle := p.Impl.Style
-
-	// Convert request format (passthrough if same style)
-	converter := &services.DefaultConverter{}
-	providerReq, err := converter.ConvertRequest(reqJson, inputStyle, outputStyle)
-	if err != nil {
-		m.logger.Error("Failed to convert request format", zap.Error(err))
-		http.Error(w, "Format conversion error", http.StatusInternalServerError)
-		return nil
-	}
-
-	res, resJson, err := cmd.DoInference(&p.Impl, providerReq, r)
+	res, resProg, err := cmd.DoInference(&p.Impl, prog, r)
 	if err != nil {
 		m.logger.Error("inference error", zap.String("provider", p.Name), zap.Error(err))
-		// Run error plugins to notify about the failure
-		_ = chain.RunError(&p.Impl, r, reqJson, res, err)
+		_ = chain.RunError(&p.Impl, r, prog, res, err)
 		return err
 	}
 
-	// Convert response back to input style (passthrough if same style)
-	if resJson != nil {
-		resJson, err = converter.ConvertResponse(resJson, outputStyle, inputStyle)
-		if err != nil {
-			m.logger.Error("Failed to convert response format", zap.Error(err))
-		}
-	}
-
 	// Run after plugins
-	resJson, err = chain.RunAfter(&p.Impl, r, reqJson, res, resJson)
+	resProg, err = chain.RunAfter(&p.Impl, r, prog, res, resProg)
 	if err != nil {
 		m.logger.Error("plugin after hook error", zap.Error(err))
 		http.Error(w, "Plugin error", http.StatusInternalServerError)
 		return nil
 	}
 
-	resData, err := resJson.Marshal()
+	// Sample response AIL
+	if hash, ok := r.Context().Value(ctxKeySampleHash).(string); ok {
+		trySampleAILResponse(hash, resProg, m.logger)
+	}
+
+	// Emit response as Chat Completions JSON
+	resData, err := responseEmitter.EmitResponse(resProg)
 	if err != nil {
-		m.logger.Error("Failed to serialize response JSON", zap.Error(err))
-		http.Error(w, "Response serialization error", http.StatusInternalServerError)
+		m.logger.Error("Failed to emit response", zap.Error(err))
+		http.Error(w, "Response emission error", http.StatusInternalServerError)
 		return nil
 	}
 
@@ -123,11 +126,14 @@ func (m *ChatCompletionsModule) serveChatCompletions(
 	return err
 }
 
+// serveChatCompletionsStream handles streaming inference.
+// Uses ail.StreamConverter for proper cross-style conversion with metadata
+// tracking, tool-call buffering, and multi-event splitting.
 func (m *ChatCompletionsModule) serveChatCompletionsStream(
 	p *modules.ProviderConfig,
 	cmd drivers.InferenceCommand,
 	chain *plugin.PluginChain,
-	reqJson styles.PartialJSON,
+	prog *ail.Program,
 	w http.ResponseWriter,
 	r *http.Request,
 ) error {
@@ -137,74 +143,86 @@ func (m *ChatCompletionsModule) serveChatCompletionsStream(
 		return err
 	}
 
-	inputStyle := styles.StyleChatCompletions
-	outputStyle := p.Impl.Style
-
-	// Convert request format (passthrough if same style)
-	converter := &services.DefaultConverter{}
-	providerReq, err := converter.ConvertRequest(reqJson, inputStyle, outputStyle)
+	// Create a stream converter: provider style → client style (ChatCompletions).
+	// Handles metadata injection, tool-call buffering, and multi-event splitting.
+	conv, err := ail.NewStreamConverter(p.Impl.Style, ail.StyleChatCompletions)
 	if err != nil {
-		m.logger.Error("Failed to convert request format", zap.Error(err))
-		_ = sseWriter.WriteError("Format conversion error")
-		_ = sseWriter.WriteDone()
-		return nil
+		m.logger.Error("failed to create stream converter", zap.Error(err))
+		return err
 	}
 
-	hres, stream, err := cmd.DoInferenceStream(&p.Impl, providerReq, r)
+	hres, stream, err := cmd.DoInferenceStream(&p.Impl, prog, r)
 	if err != nil {
 		m.logger.Error("inference stream error (start)", zap.String("provider", p.Name), zap.Error(err))
-		// Run error plugins to notify about the failure
-		_ = chain.RunError(&p.Impl, r, reqJson, hres, err)
+		_ = chain.RunError(&p.Impl, r, prog, hres, err)
 		_ = sseWriter.WriteError("start failed")
 		_ = sseWriter.WriteDone()
 		return err
 	}
 
-	var lastChunk styles.PartialJSON
+	// StreamAssembler accumulates all chunk programs into a complete response
+	// for sampling and the StreamEnd plugin hook.
+	asm := ail.NewStreamAssembler()
+	var lastChunk *ail.Program
 
 	for chunk := range stream {
 		if chunk.RuntimeError != nil {
 			_ = sseWriter.WriteError(chunk.RuntimeError.Error())
-			// Run error plugins for runtime stream errors
-			_ = chain.RunError(&p.Impl, r, reqJson, hres, chunk.RuntimeError)
+			_ = chain.RunError(&p.Impl, r, prog, hres, chunk.RuntimeError)
 			return nil
 		}
 
-		chunkJson := chunk.Data
+		chunkProg := chunk.Data
 
-		// Convert chunk (passthrough if same style)
-		if chunkJson != nil {
-			converted, err := converter.ConvertResponseChunk(chunkJson, outputStyle, inputStyle)
-			if err == nil {
-				chunkJson = converted
-			}
-		}
-
-		// Run after-chunk plugins
-		chunkJson, err = chain.RunAfterChunk(&p.Impl, r, reqJson, hres, chunkJson)
+		// Run after-chunk plugins (may modify the AIL program)
+		chunkProg, err = chain.RunAfterChunk(&p.Impl, r, prog, hres, chunkProg)
 		if err != nil {
 			m.logger.Error("plugin after chunk error", zap.Error(err))
 			continue
 		}
 
-		if chunkJson != nil {
-			lastChunk = chunkJson
+		if chunkProg != nil {
+			lastChunk = chunkProg
+			asm.Push(chunkProg)
 
-			chankData, err := chunkJson.Marshal()
+			// Convert chunk to client format via StreamConverter.
+			// PushProgram handles metadata tracking, tool buffering,
+			// and may return 0..N output chunks.
+			outputs, err := conv.PushProgram(chunkProg)
 			if err != nil {
-				m.logger.Error("chat completions stream chunk marshal error", zap.Error(err))
+				m.logger.Error("stream convert error", zap.Error(err))
 				continue
 			}
 
-			if err := sseWriter.WriteRaw(chankData); err != nil {
-				m.logger.Error("chat completions stream write error", zap.Error(err))
-				return err
+			for _, out := range outputs {
+				if err := sseWriter.WriteRaw(out); err != nil {
+					m.logger.Error("stream write error", zap.Error(err))
+					return err
+				}
+			}
+		}
+	}
+
+	// Flush any buffered data from the converter (e.g., pending tool calls
+	// for targets that require complete function objects).
+	if final, err := conv.Flush(); err != nil {
+		m.logger.Error("stream converter flush error", zap.Error(err))
+	} else {
+		for _, out := range final {
+			if err := sseWriter.WriteRaw(out); err != nil {
+				m.logger.Error("stream flush write error", zap.Error(err))
+				break
 			}
 		}
 	}
 
 	// Run stream end plugins
-	_ = chain.RunStreamEnd(&p.Impl, r, reqJson, hres, lastChunk)
+	_ = chain.RunStreamEnd(&p.Impl, r, prog, hres, lastChunk)
+
+	// Sample the assembled complete response (all chunks, not just last)
+	if hash, ok := r.Context().Value(ctxKeySampleHash).(string); ok {
+		trySampleAILResponse(hash, asm.Program(), m.logger)
+	}
 
 	_ = sseWriter.WriteDone()
 	return nil
@@ -213,25 +231,38 @@ func (m *ChatCompletionsModule) serveChatCompletionsStream(
 func (m *ChatCompletionsModule) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	m.logger.Debug("Chat completions request received", zap.String("path", r.URL.Path), zap.String("method", r.Method))
 
-	reqBody, err := io.ReadAll(r.Body)
-	if err != nil {
-		m.logger.Error("failed to read request body", zap.Error(err))
-		http.Error(w, "failed to read request body", http.StatusBadRequest)
-		return nil
-	}
+	// Check if an AIL program is already in context (recursive call from plugin)
+	var prog *ail.Program
+	if ctxProg, ok := ail.ProgramFromContext(r.Context()); ok {
+		prog = ctxProg
+		m.logger.Debug("Using AIL program from context (recursive call)")
+	} else {
+		// Parse incoming request body into AIL
+		reqBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			m.logger.Error("failed to read request body", zap.Error(err))
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return nil
+		}
 
-	m.logger.Debug("Request body read", zap.Int("body_length", len(reqBody)))
+		m.logger.Debug("Request body read", zap.Int("body_length", len(reqBody)))
 
-	reqJson, err := styles.ParsePartialJSON(reqBody)
-	if err != nil {
-		m.logger.Error("failed to parse request JSON", zap.Error(err))
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
-		return nil
+		prog, err = requestParser.ParseRequest(reqBody)
+		if err != nil {
+			m.logger.Error("failed to parse request into AIL", zap.Error(err))
+			http.Error(w, "invalid request JSON", http.StatusBadRequest)
+			return nil
+		}
+
+		// Sample AIL to disk when SAMPLE_AIL is set
+		if hash := trySampleAIL(reqBody, prog, m.logger); hash != "" {
+			r = r.WithContext(context.WithValue(r.Context(), ctxKeySampleHash, hash))
+		}
 	}
 
 	m.logger.Debug("Request parsed",
-		zap.String("model", styles.TryGetFromPartialJSON[string](reqJson, "model")),
-		zap.Bool("streaming", styles.TryGetFromPartialJSON[bool](reqJson, "stream")))
+		zap.String("model", prog.GetModel()),
+		zap.Bool("streaming", prog.IsStreaming()))
 
 	router, ok := modules.GetRouter(m.RouterName)
 	if !ok {
@@ -240,26 +271,43 @@ func (m *ChatCompletionsModule) ServeHTTP(w http.ResponseWriter, r *http.Request
 		return nil
 	}
 
-	// Collect incoming auth early so plugins can rely on context values
-	r, err = router.Impl.Auth.CollectIncomingAuth(r)
+	// Collect incoming auth
+	r, err := router.Impl.Auth.CollectIncomingAuth(r)
 	if err != nil {
 		m.logger.Error("failed to collect incoming auth", zap.Error(err))
 		http.Error(w, "authentication error", http.StatusUnauthorized)
 		return nil
 	}
 
-	chain := plugin.TryResolvePlugins(*r.URL, styles.TryGetFromPartialJSON[string](reqJson, "model"))
+	// Resolve virtual model aliases (may chain: virtual→virtual→real).
+	// Each iteration re-resolves the plugin chain for the new model so that
+	// plugins injected by the virtual mapping (target+plugins) are picked up.
+	model := prog.GetModel()
+	var chain *plugin.PluginChain
+	const maxRewriteDepth = 10
+	for i := 0; i < maxRewriteDepth; i++ {
+		chain = plugin.TryResolvePlugins(*r.URL, model)
+		if rewritten := chain.RunModelRewrite(model); rewritten != model {
+			m.logger.Debug("Virtual model resolved",
+				zap.String("from", model),
+				zap.String("to", rewritten))
+			model = rewritten
+			continue
+		}
+		break
+	}
+	prog.SetModel(model)
 
 	m.logger.Debug("Resolved plugins", zap.Int("plugin_count", len(chain.GetPlugins())))
 
 	traceId := uuid.New().String()
 	r = r.WithContext(context.WithValue(r.Context(), plugin.ContextTraceID(), traceId))
 
-	// Create invoker for recursive handler plugins
+	// Create invoker for recursive handler plugins (fallback, parallel, etc.)
 	invoker := plugin.NewCaddyModuleInvoker(m)
 
 	// Check if any recursive handler plugin wants to handle this request
-	handled, err := chain.RunRecursiveHandlers(invoker, reqJson, w, r)
+	handled, err := chain.RunRecursiveHandlers(invoker, prog, w, r)
 	if handled {
 		if err != nil {
 			m.logger.Error("recursive handler plugin failed", zap.Error(err))
@@ -269,7 +317,7 @@ func (m *ChatCompletionsModule) ServeHTTP(w http.ResponseWriter, r *http.Request
 	}
 
 	// Normal flow - handle request directly
-	err = m.handleRequest(router, chain, reqJson, w, r)
+	err = m.handleRequest(router, chain, prog, w, r)
 	if err != nil {
 		m.logger.Error("request handling failed", zap.Error(err))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -283,11 +331,11 @@ func (m *ChatCompletionsModule) ServeHTTP(w http.ResponseWriter, r *http.Request
 func (m *ChatCompletionsModule) handleRequest(
 	router *modules.RouterModule,
 	chain *plugin.PluginChain,
-	reqJson styles.PartialJSON,
+	prog *ail.Program,
 	w http.ResponseWriter,
 	r *http.Request,
 ) error {
-	providers, model := router.ResolveProvidersOrderAndModel(styles.TryGetFromPartialJSON[string](reqJson, "model"))
+	providers, model := router.ResolveProvidersOrderAndModel(prog.GetModel())
 
 	m.logger.Debug("Resolved providers",
 		zap.String("model", model),
@@ -310,14 +358,12 @@ func (m *ChatCompletionsModule) handleRequest(
 			continue
 		}
 
-		providerReq, err := reqJson.CloneWith("model", model)
-		if err != nil {
-			m.logger.Error("failed to clone request JSON with new model", zap.Error(err))
-			continue
-		}
+		// Clone the program and set the resolved model
+		providerProg := prog.Clone()
+		providerProg.SetModel(model)
 
 		// Run before plugins with provider context
-		processedReq, err := chain.RunBefore(&p.Impl, r, providerReq)
+		processedProg, err := chain.RunBefore(&p.Impl, r, providerProg)
 		if err != nil {
 			m.logger.Error("plugin before hook error", zap.String("provider", name), zap.Error(err))
 			if displayErr == nil {
@@ -325,12 +371,12 @@ func (m *ChatCompletionsModule) handleRequest(
 			}
 			continue
 		}
-		providerReq = processedReq
+		providerProg = processedProg
 
 		m.logger.Debug("Executing inference",
 			zap.String("provider", name),
 			zap.String("style", string(p.Impl.Style)),
-			zap.Bool("streaming", styles.TryGetFromPartialJSON[bool](providerReq, "stream")))
+			zap.Bool("streaming", providerProg.IsStreaming()))
 
 		// Success - set response headers
 		w.Header().Set("X-Real-Provider-Id", name)
@@ -339,18 +385,18 @@ func (m *ChatCompletionsModule) handleRequest(
 		// Build plugin list for header
 		var pluginNames []string
 		for _, pi := range chain.GetPlugins() {
-			name := pi.Plugin.Name()
+			pname := pi.Plugin.Name()
 			if pi.Params != "" {
-				name += ":" + pi.Params
+				pname += ":" + pi.Params
 			}
-			pluginNames = append(pluginNames, name)
+			pluginNames = append(pluginNames, pname)
 		}
 		w.Header().Set("X-Plugins-Executed", strings.Join(pluginNames, ","))
 
-		if styles.TryGetFromPartialJSON[bool](providerReq, "stream") {
-			err = m.serveChatCompletionsStream(p, cmd, chain, providerReq, w, r)
+		if providerProg.IsStreaming() {
+			err = m.serveChatCompletionsStream(p, cmd, chain, providerProg, w, r)
 		} else {
-			err = m.serveChatCompletions(p, cmd, chain, providerReq, w, r)
+			err = m.serveChatCompletions(p, cmd, chain, providerProg, w, r)
 		}
 
 		if err != nil {
@@ -368,6 +414,85 @@ func (m *ChatCompletionsModule) handleRequest(
 	}
 
 	return nil
+}
+
+// trySampleAIL persists the AIL program to sampleAILDir when SAMPLE_AIL is set.
+// Files are keyed by the SHA-256 of the raw request body so duplicates are
+// deduplicated automatically. Each request produces:
+//   - <hash>.ail      – compact binary encoding
+//   - <hash>.ail.txt  – human-readable disassembly
+//
+// Returns the hex hash so callers can pair a response sample with the same key.
+func trySampleAIL(reqBody []byte, prog *ail.Program, logger *zap.Logger) string {
+	if sampleAILDir == "" {
+		return ""
+	}
+
+	// Ensure the directory exists (once per unique path, mkdir is idempotent)
+	if err := os.MkdirAll(sampleAILDir, 0o755); err != nil {
+		logger.Error("SAMPLE_AIL: failed to create directory", zap.String("dir", sampleAILDir), zap.Error(err))
+		return ""
+	}
+
+	hash := sha256.Sum256(reqBody)
+	name := hex.EncodeToString(hash[:])
+
+	// Binary encoding
+	binPath := filepath.Join(sampleAILDir, name+".ail")
+	if _, err := os.Stat(binPath); err == nil {
+		// Already sampled this exact request — still return name for response pairing
+		return name
+	}
+
+	var buf bytes.Buffer
+	if err := prog.Encode(&buf); err != nil {
+		logger.Error("SAMPLE_AIL: binary encode failed", zap.Error(err))
+		return name
+	}
+	if err := os.WriteFile(binPath, buf.Bytes(), 0o644); err != nil {
+		logger.Error("SAMPLE_AIL: write binary failed", zap.String("path", binPath), zap.Error(err))
+		return name
+	}
+
+	// Human-readable disassembly
+	txtPath := filepath.Join(sampleAILDir, name+".ail.txt")
+	if err := os.WriteFile(txtPath, []byte(prog.Disasm()), 0o644); err != nil {
+		logger.Error("SAMPLE_AIL: write disasm failed", zap.String("path", txtPath), zap.Error(err))
+		return name
+	}
+
+	logger.Debug("SAMPLE_AIL: saved request", zap.String("hash", name), zap.String("dir", sampleAILDir))
+	return name
+}
+
+// trySampleAILResponse persists a response AIL program paired with the request
+// that produced it. Files are written as:
+//   - <hash>.res.ail      – compact binary encoding of the response
+//   - <hash>.res.ail.txt  – human-readable disassembly of the response
+func trySampleAILResponse(reqHash string, prog *ail.Program, logger *zap.Logger) {
+	if sampleAILDir == "" || reqHash == "" || prog == nil {
+		return
+	}
+
+	binPath := filepath.Join(sampleAILDir, reqHash+".res.ail")
+
+	var buf bytes.Buffer
+	if err := prog.Encode(&buf); err != nil {
+		logger.Error("SAMPLE_AIL: response binary encode failed", zap.Error(err))
+		return
+	}
+	if err := os.WriteFile(binPath, buf.Bytes(), 0o644); err != nil {
+		logger.Error("SAMPLE_AIL: write response binary failed", zap.String("path", binPath), zap.Error(err))
+		return
+	}
+
+	txtPath := filepath.Join(sampleAILDir, reqHash+".res.ail.txt")
+	if err := os.WriteFile(txtPath, []byte(prog.Disasm()), 0o644); err != nil {
+		logger.Error("SAMPLE_AIL: write response disasm failed", zap.String("path", txtPath), zap.Error(err))
+		return
+	}
+
+	logger.Debug("SAMPLE_AIL: saved response", zap.String("hash", reqHash), zap.String("dir", sampleAILDir))
 }
 
 var (

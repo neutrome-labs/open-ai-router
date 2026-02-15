@@ -7,17 +7,20 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/neutrome-labs/ail"
 	"github.com/neutrome-labs/open-ai-router/src/drivers"
 	"github.com/neutrome-labs/open-ai-router/src/services"
 	"github.com/neutrome-labs/open-ai-router/src/sse"
-	"github.com/neutrome-labs/open-ai-router/src/styles"
 	"go.uber.org/zap"
 )
 
-// Responses implements the OpenAI Responses API
+// Responses implements the OpenAI Responses API using AIL.
 type Responses struct{}
 
-func (c *Responses) createRequest(p *services.ProviderService, reqJson styles.PartialJSON, r *http.Request, endpoint string) (*http.Request, error) {
+var responsesEmitter = &ail.ResponsesEmitter{}
+var responsesParser = &ail.ResponsesParser{}
+
+func (c *Responses) createRequest(p *services.ProviderService, prog *ail.Program, r *http.Request, endpoint string) (*http.Request, error) {
 	targetUrl := p.ParsedURL
 	targetUrl.Path += endpoint
 
@@ -25,9 +28,10 @@ func (c *Responses) createRequest(p *services.ProviderService, reqJson styles.Pa
 	targetHeader.Del("Accept-Encoding")
 	targetHeader.Set("Content-Type", "application/json")
 
-	reqBody, err := reqJson.Marshal()
+	// Emit the AIL program as Responses API JSON
+	reqBody, err := responsesEmitter.EmitRequest(prog)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("openai responses: emit request: %w", err)
 	}
 
 	httpReq := &http.Request{
@@ -50,14 +54,14 @@ func (c *Responses) createRequest(p *services.ProviderService, reqJson styles.Pa
 	return httpReq, nil
 }
 
-// DoInference implements InferenceCommand for OpenAI Responses API
-func (c *Responses) DoInference(p *services.ProviderService, reqJson styles.PartialJSON, r *http.Request) (*http.Response, styles.PartialJSON, error) {
+// DoInference implements InferenceCommand for OpenAI Responses API.
+func (c *Responses) DoInference(p *services.ProviderService, prog *ail.Program, r *http.Request) (*http.Response, *ail.Program, error) {
 	Logger.Debug("DoInference (responses) starting",
 		zap.String("provider", p.Name),
-		zap.String("model", styles.TryGetFromPartialJSON[string](reqJson, "model")),
+		zap.String("model", prog.GetModel()),
 		zap.String("base_url", p.ParsedURL.String()))
 
-	httpReq, err := c.createRequest(p, reqJson, r, "/responses")
+	httpReq, err := c.createRequest(p, prog, r, "/responses")
 	if err != nil {
 		Logger.Error("DoInference (responses) createRequest failed", zap.Error(err))
 		return nil, nil, err
@@ -83,23 +87,23 @@ func (c *Responses) DoInference(p *services.ProviderService, reqJson styles.Part
 		return res, nil, fmt.Errorf("%s", string(respData))
 	}
 
-	respJson, err := styles.ParsePartialJSON(respData)
+	respProg, err := responsesParser.ParseResponse(respData)
 	if err != nil {
-		Logger.Error("DoInference (responses) response JSON parse failed", zap.Error(err))
+		Logger.Error("DoInference (responses) response parse failed", zap.Error(err))
 		return res, nil, err
 	}
 
 	Logger.Debug("DoInference (responses) completed successfully")
 
-	return res, respJson, nil
+	return res, respProg, nil
 }
 
-// DoInferenceStream implements InferenceCommand for streaming OpenAI Responses
-func (c *Responses) DoInferenceStream(p *services.ProviderService, reqJson styles.PartialJSON, r *http.Request) (*http.Response, chan drivers.InferenceStreamChunk, error) {
+// DoInferenceStream implements InferenceCommand for streaming OpenAI Responses.
+func (c *Responses) DoInferenceStream(p *services.ProviderService, prog *ail.Program, r *http.Request) (*http.Response, chan drivers.InferenceStreamChunk, error) {
 	Logger.Debug("DoInferenceStream (responses) starting",
 		zap.String("provider", p.Name))
 
-	httpReq, err := c.createRequest(p, reqJson, r, "/responses")
+	httpReq, err := c.createRequest(p, prog, r, "/responses")
 	if err != nil {
 		Logger.Error("DoInferenceStream (responses) createRequest failed", zap.Error(err))
 		return nil, nil, err
@@ -144,13 +148,13 @@ func (c *Responses) DoInferenceStream(p *services.ProviderService, reqJson style
 				return
 			}
 
-			respJson, err := styles.ParsePartialJSON(respData)
+			respProg, err := responsesParser.ParseResponse(respData)
 			if err != nil {
 				chunks <- drivers.InferenceStreamChunk{RuntimeError: err}
 				return
 			}
 
-			chunks <- drivers.InferenceStreamChunk{Data: respJson}
+			chunks <- drivers.InferenceStreamChunk{Data: respProg}
 			return
 		}
 
@@ -164,12 +168,12 @@ func (c *Responses) DoInferenceStream(p *services.ProviderService, reqJson style
 				return
 			}
 			if event.Data != nil {
-				jsonData, err := styles.ParsePartialJSON(event.Data)
+				chunkProg, err := responsesParser.ParseStreamChunk(event.Data)
 				if err != nil {
 					chunks <- drivers.InferenceStreamChunk{RuntimeError: err}
 					return
 				}
-				chunks <- drivers.InferenceStreamChunk{Data: jsonData}
+				chunks <- drivers.InferenceStreamChunk{Data: chunkProg}
 			}
 		}
 	}()

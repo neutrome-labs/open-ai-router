@@ -5,6 +5,7 @@ go 1.25.5
 require (
 	github.com/caddyserver/caddy/v2 v2.10.2
 	github.com/google/uuid v1.6.0
+	github.com/neutrome-labs/ail v0.0.0
 	github.com/posthog/posthog-go v1.6.13
 	go.uber.org/zap v1.27.1
 )
@@ -157,3 +158,5 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	howett.net/plist v1.0.0 // indirect
 )
+
+replace github.com/neutrome-labs/ail => ../ail

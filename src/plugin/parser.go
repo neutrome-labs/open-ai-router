@@ -5,26 +5,22 @@ import (
 	"strings"
 )
 
-// HeadPlugins are plugins that are always executed before others
-// Order matters: models (fallback) should run before parallel (fan-out)
-var HeadPlugins = [][2]string{
-	{"models", ""},
-	// {"parallel", ""},
-}
+// HeadPlugins are plugins that are always executed before others.
+// Disabled during AIL rework — models and parallel plugins not yet migrated.
+var HeadPlugins = [][2]string{}
 
-// TailPlugins are plugins that are always executed after others
-var TailPlugins = [][2]string{
-	{"posthog", ""},
-}
+// TailPlugins are plugins that are always executed after others.
+// Disabled during AIL rework — posthog plugin not yet migrated.
+var TailPlugins = [][2]string{}
 
 func TryResolvePlugins(url url.URL, model string) *PluginChain {
 	chain := NewPluginChain()
 
-	// Add all virtual provider plugins first (they implement RecursiveHandlerPlugin)
-	// These intercept requests targeting virtual providers
+	// Add all virtual provider plugins (model rewriters).
+	// They run via RunModelRewrite before the main plugin flow.
 	for name, p := range Registry {
 		if strings.HasPrefix(name, "virtual:") {
-			if _, ok := p.(RecursiveHandlerPlugin); ok {
+			if _, ok := p.(ModelRewritePlugin); ok {
 				chain.Add(p, "")
 			}
 		}

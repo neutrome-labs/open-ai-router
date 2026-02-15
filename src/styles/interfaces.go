@@ -1,33 +1,37 @@
 package styles
 
 import (
-	"encoding/json"
 	"fmt"
-	"maps"
 
+	"github.com/neutrome-labs/ail"
 	"go.uber.org/zap"
 )
 
 // Logger for debug output (set by module during Provision)
 var Logger *zap.Logger = zap.NewNop()
 
-// Style represents a provider's API style
-type Style string
+// Style is an alias for ail.Style so the rest of the router code keeps working
+// without importing `ail` directly. When ail is extracted to its own module,
+// this alias will point to the external package.
+type Style = ail.Style
 
+// Re-export style constants from the ail package — single source of truth.
+// StyleVirtual is router-only: it has no upstream provider, so AIL doesn't
+// (and shouldn't) define a parser/emitter for it.
 const (
 	StyleUnknown         Style = ""
 	StyleVirtual         Style = "virtual"
-	StyleChatCompletions Style = "openai-chat-completions"
-	StyleResponses       Style = "openai-responses"
-	StyleAnthropic       Style = "anthropic-messages"
-	StyleGoogleGenAI     Style = "google-genai"
-	StyleCfAiGateway     Style = "cloudflare-ai-gateway"
-	StyleCfWorkersAi     Style = "cloudflare-workers-ai"
+	StyleChatCompletions       = ail.StyleChatCompletions
+	StyleResponses             = ail.StyleResponses
+	StyleAnthropic             = ail.StyleAnthropic
+	StyleGoogleGenAI           = ail.StyleGoogleGenAI
+	StyleCfAiGateway           = ail.StyleCfAiGateway
+	StyleCfWorkersAi           = ail.StyleCfWorkersAi
 )
 
-type PartialJSON map[string]json.RawMessage
-
-// ParseStyle parses a style string, defaulting to OpenAI chat completions
+// ParseStyle parses a style string, defaulting to OpenAI chat completions.
+// This is the router-level parser that knows about all styles including
+// router-only ones like "virtual".
 func ParseStyle(s string) (Style, error) {
 	switch s {
 	case "virtual":
@@ -47,75 +51,4 @@ func ParseStyle(s string) (Style, error) {
 	default:
 		return StyleUnknown, fmt.Errorf("unknown style: %s", s)
 	}
-}
-
-func ParsePartialJSON(data []byte) (PartialJSON, error) {
-	var pj PartialJSON
-	err := json.Unmarshal(data, &pj)
-	return pj, err
-}
-
-func PartiallyMarshalJSON(obj any) (PartialJSON, error) {
-	// todo find a way to avoid double marshal
-	data, err := json.Marshal(obj)
-	if err != nil {
-		return nil, err
-	}
-	return ParsePartialJSON(data)
-}
-
-func GetFromPartialJSON[T any](pj PartialJSON, key string) (T, error) {
-	var zero T
-	raw, ok := pj[key]
-	if !ok {
-		return zero, nil
-	}
-	var result T
-	err := json.Unmarshal(raw, &result)
-	if err != nil {
-		return zero, err
-	}
-	return result, nil
-}
-
-func TryGetFromPartialJSON[T any](pj PartialJSON, key string) T {
-	var zero T
-	raw, ok := pj[key]
-	if !ok {
-		return zero
-	}
-	var result T
-	err := json.Unmarshal(raw, &result)
-	if err != nil {
-		return zero
-	}
-	return result
-}
-
-func (pj PartialJSON) Set(key string, value any) error {
-	b, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	pj[key] = b
-	return nil
-}
-
-func (pj PartialJSON) Clone() PartialJSON {
-	clone := make(PartialJSON)
-	maps.Copy(clone, pj)
-	return clone
-}
-
-func (pj PartialJSON) CloneWith(key string, value any) (PartialJSON, error) {
-	clone := pj.Clone()
-	err := clone.Set(key, value)
-	if err != nil {
-		return nil, err
-	}
-	return clone, nil
-}
-
-func (pj PartialJSON) Marshal() ([]byte, error) {
-	return json.Marshal(pj)
 }

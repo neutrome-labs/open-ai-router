@@ -4,8 +4,8 @@ package drivers
 import (
 	"net/http"
 
+	"github.com/neutrome-labs/ail"
 	"github.com/neutrome-labs/open-ai-router/src/services"
-	"github.com/neutrome-labs/open-ai-router/src/styles"
 )
 
 // ListModelsModel represents a model from a provider
@@ -22,19 +22,20 @@ type ListModelsCommand interface {
 	DoListModels(p *services.ProviderService, r *http.Request) ([]ListModelsModel, error)
 }
 
-// InferenceStreamChunk represents a streaming response chunk
+// InferenceStreamChunk represents a streaming response chunk as an AIL program fragment.
 type InferenceStreamChunk struct {
-	Data         styles.PartialJSON
+	Data         *ail.Program
 	RuntimeError error
 }
 
 // InferenceCommand is the unified interface for all inference APIs.
-// Each driver (Chat Completions, Responses, Anthropic Messages, etc.)
-// implements this interface to handle requests in their native format.
-// The module handles format conversion at the boundary.
+// Each driver takes an AIL Program, converts it to the provider's native format
+// internally, makes the HTTP call, and parses the response back into an AIL Program.
 type InferenceCommand interface {
-	// DoInference sends a non-streaming inference request
-	DoInference(p *services.ProviderService, reqJson styles.PartialJSON, r *http.Request) (*http.Response, styles.PartialJSON, error)
-	// DoInferenceStream sends a streaming inference request
-	DoInferenceStream(p *services.ProviderService, reqJson styles.PartialJSON, r *http.Request) (*http.Response, chan InferenceStreamChunk, error)
+	// DoInference sends a non-streaming inference request.
+	// Takes an AIL program, returns the response as an AIL program.
+	DoInference(p *services.ProviderService, prog *ail.Program, r *http.Request) (*http.Response, *ail.Program, error)
+	// DoInferenceStream sends a streaming inference request.
+	// Returns a channel of AIL program chunks.
+	DoInferenceStream(p *services.ProviderService, prog *ail.Program, r *http.Request) (*http.Response, chan InferenceStreamChunk, error)
 }
