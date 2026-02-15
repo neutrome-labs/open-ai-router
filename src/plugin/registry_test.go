@@ -20,6 +20,24 @@ func TestPluginRegistry(t *testing.T) {
 	if p.Name() != "fuzz" {
 		t.Errorf("Plugin name mismatch: got %q, want %q", p.Name(), "fuzz")
 	}
+
+	// stools plugin
+	p, ok = plugin.GetPlugin("stools")
+	if !ok {
+		t.Fatal("Plugin \"stools\" not found in registry")
+	}
+	if p.Name() != "stools" {
+		t.Errorf("Plugin name mismatch: got %q, want %q", p.Name(), "stools")
+	}
+
+	// slwin plugin
+	p, ok = plugin.GetPlugin("slwin")
+	if !ok {
+		t.Fatal("Plugin \"slwin\" not found in registry")
+	}
+	if p.Name() != "slwin" {
+		t.Errorf("Plugin name mismatch: got %q, want %q", p.Name(), "slwin")
+	}
 }
 
 func TestPluginChain_Add(t *testing.T) {
@@ -94,7 +112,6 @@ func TestPluginChain_RunAfter(t *testing.T) {
 }
 
 func TestMandatoryPlugins(t *testing.T) {
-	// HeadPlugins and TailPlugins are empty during AIL rework
 	if len(plugin.HeadPlugins) != 0 {
 		t.Errorf("Expected empty HeadPlugins, got %d", len(plugin.HeadPlugins))
 	}

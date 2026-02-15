@@ -14,4 +14,8 @@ func init() {
 	caddy.RegisterModule(&ChatCompletionsModule{})
 	httpcaddyfile.RegisterHandlerDirective("ai_chat_completions", ParseChatCompletionsModule)
 	httpcaddyfile.RegisterDirectiveOrder("ai_chat_completions", httpcaddyfile.Before, "header")
+
+	caddy.RegisterModule(&AILModule{})
+	httpcaddyfile.RegisterHandlerDirective("ail", ParseAILModule)
+	httpcaddyfile.RegisterDirectiveOrder("ail", httpcaddyfile.Before, "header")
 }

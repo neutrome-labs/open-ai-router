@@ -5,6 +5,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/neutrome-labs/open-ai-router/src/plugin"
+	"github.com/neutrome-labs/open-ai-router/src/plugins"
 	"github.com/neutrome-labs/open-ai-router/src/plugins/flow"
 	"github.com/neutrome-labs/open-ai-router/src/services"
 )
@@ -15,9 +16,8 @@ func init() {
 	services.TryInstrumentAppObservability()
 
 	plugin.RegisterPlugin("fuzz", &flow.Fuzz{})
-	// Note: Old plugins (posthog, models, parallel, swarm, stools, zip)
-	// are disabled during the AIL rework. They can be migrated later by
-	// implementing the new plugin interfaces.
+	plugin.RegisterPlugin("stools", &plugins.StripTools{})
+	plugin.RegisterPlugin("slwin", &plugins.SlidingWindow{})
 
 	defer func() {
 		_ = services.FireObservabilityEvent("app", "", "init", map[string]any{

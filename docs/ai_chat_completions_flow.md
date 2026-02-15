@@ -1,6 +1,6 @@
 # Chat Completions Data Flow
 
-This document describes how HTTP requests and responses (headers and bodies) flow through the `ai_chat_completions` Caddy module.
+This document describes how HTTP requests and responses (headers and bodies) flow through the `ai_chat_completions` and `ail` Caddy modules.
 
 ## High-Level Architecture
 
@@ -545,3 +545,71 @@ type StreamChunkPlugin interface {
     AfterChunk(params string, p *ProviderService, r *http.Request, reqJson styles.PartialJSON, res *http.Response, chunk styles.PartialJSON) (styles.PartialJSON, error)
 }
 ```
+
+## AIL Handler (`ail` directive)
+
+The `ail` handler provides a raw AIL endpoint that bypasses JSON serialization entirely.
+Clients can POST AIL programs in binary or text format and receive inference responses in the same format.
+
+### AIL Request Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant AIL as AILModule
+    participant R as RouterModule
+    participant P as PluginChain
+    participant D as InferenceCommand
+    participant API as Provider API
+
+    C->>AIL: POST /v1/ail (binary or text AIL)
+    AIL->>AIL: Detect format (magic bytes or Content-Type)
+    alt Binary AIL
+        AIL->>AIL: ail.Decode(body)
+    else Text AIL
+        AIL->>AIL: ail.Asm(body)
+    end
+    AIL->>R: GetRouter(name)
+    AIL->>R: CollectIncomingAuth
+    AIL->>P: Resolve plugins and model rewrites
+    AIL->>R: ResolveProvidersOrderAndModel
+    loop Each provider
+        AIL->>P: RunBefore
+        alt Non-streaming
+            AIL->>D: DoInference
+            D->>API: HTTP request
+            API-->>D: JSON response
+            D-->>AIL: response *ail.Program
+            AIL->>P: RunAfter
+        else Streaming (collected)
+            AIL->>D: DoInferenceStream
+            D->>API: HTTP request (SSE)
+            loop Each chunk
+                API-->>D: SSE chunk
+                D-->>AIL: chunk *ail.Program
+                AIL->>P: RunAfterChunk
+                AIL->>AIL: StreamAssembler.Push
+            end
+            AIL->>P: RunStreamEnd
+            AIL->>AIL: StreamAssembler.Program()
+        end
+    end
+    alt Binary output (Accept: application/x-ail)
+        AIL->>AIL: prog.Encode()
+        AIL-->>C: binary AIL response
+    else Text output (Accept: text/plain)
+        AIL->>AIL: prog.Disasm()
+        AIL-->>C: text AIL response
+    end
+```
+
+### Content Negotiation
+
+| Header       | Value                                            | Effect               |
+|--------------|--------------------------------------------------|-----------------------|
+| Content-Type | `application/x-ail`, `application/octet-stream`  | Binary AIL input      |
+| Content-Type | `text/plain`, `text/x-ail`                       | Text AIL input        |
+| Content-Type | _(absent)_                                       | Auto-detect via magic |
+| Accept       | `application/x-ail`                              | Binary AIL output     |
+| Accept       | `text/plain`                                     | Text AIL output       |
+| Accept       | _(absent)_                                       | Mirror input format   |

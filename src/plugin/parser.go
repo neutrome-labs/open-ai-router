@@ -6,11 +6,9 @@ import (
 )
 
 // HeadPlugins are plugins that are always executed before others.
-// Disabled during AIL rework — models and parallel plugins not yet migrated.
 var HeadPlugins = [][2]string{}
 
 // TailPlugins are plugins that are always executed after others.
-// Disabled during AIL rework — posthog plugin not yet migrated.
 var TailPlugins = [][2]string{}
 
 func TryResolvePlugins(url url.URL, model string) *PluginChain {

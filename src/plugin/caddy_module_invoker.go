@@ -1,11 +1,11 @@
 package plugin
 
 import (
-	"fmt"
 	"net/http"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/neutrome-labs/ail"
+	"github.com/neutrome-labs/open-ai-router/src/services"
 )
 
 // CaddyModuleInvoker invokes Caddy HTTP modules as plugins.
@@ -28,8 +28,19 @@ func (inv *CaddyModuleInvoker) InvokeHandler(prog *ail.Program, w http.ResponseW
 	return inv.module.ServeHTTP(w, newR, nil)
 }
 
-// InvokeHandlerCapture invokes the handler and captures the response.
-// Currently a stub — parallel plugin is disabled in the AIL rework.
+// InvokeHandlerCapture invokes the handler and captures the response as an AIL program.
+// The response is captured via ResponseCaptureWriter and parsed back from
+// ChatCompletions JSON into AIL. Used by parallel/fan-out plugins.
 func (inv *CaddyModuleInvoker) InvokeHandlerCapture(prog *ail.Program, r *http.Request) (*ail.Program, error) {
-	return nil, fmt.Errorf("InvokeHandlerCapture not yet implemented in AIL mode")
+	capture := &services.ResponseCaptureWriter{}
+	if err := inv.InvokeHandler(prog, capture, r); err != nil {
+		return nil, err
+	}
+
+	if len(capture.Response) == 0 {
+		return ail.NewProgram(), nil
+	}
+
+	parser := &ail.ChatCompletionsParser{}
+	return parser.ParseResponse(capture.Response)
 }
