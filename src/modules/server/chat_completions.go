@@ -373,6 +373,11 @@ func (m *ChatCompletionsModule) handleRequest(
 		}
 		providerProg = processedProg
 
+		// Sample the upstream-prepared AIL (after model resolve + plugins)
+		if hash, ok := r.Context().Value(ctxKeySampleHash).(string); ok {
+			trySampleAILUpstream(hash, providerProg, m.logger)
+		}
+
 		m.logger.Debug("Executing inference",
 			zap.String("provider", name),
 			zap.String("style", string(p.Impl.Style)),
@@ -418,11 +423,15 @@ func (m *ChatCompletionsModule) handleRequest(
 
 // trySampleAIL persists the AIL program to sampleAILDir when SAMPLE_AIL is set.
 // Files are keyed by the SHA-256 of the raw request body so duplicates are
-// deduplicated automatically. Each request produces:
-//   - <hash>.ail      – compact binary encoding
-//   - <hash>.ail.txt  – human-readable disassembly
+// deduplicated automatically. Each request produces up to 6 files:
+//   - <hash>.ail         – compact binary encoding of the original request
+//   - <hash>.ail.txt     – human-readable disassembly of the original request
+//   - <hash>.up.ail      – compact binary encoding of the upstream-prepared request
+//   - <hash>.up.ail.txt  – human-readable disassembly of the upstream-prepared request
+//   - <hash>.res.ail     – compact binary encoding of the response
+//   - <hash>.res.ail.txt – human-readable disassembly of the response
 //
-// Returns the hex hash so callers can pair a response sample with the same key.
+// Returns the hex hash so callers can pair upstream/response samples with the same key.
 func trySampleAIL(reqBody []byte, prog *ail.Program, logger *zap.Logger) string {
 	if sampleAILDir == "" {
 		return ""
@@ -463,6 +472,36 @@ func trySampleAIL(reqBody []byte, prog *ail.Program, logger *zap.Logger) string 
 
 	logger.Debug("SAMPLE_AIL: saved request", zap.String("hash", name), zap.String("dir", sampleAILDir))
 	return name
+}
+
+// trySampleAILUpstream persists the fully-prepared upstream request AIL program
+// (after model resolution and all before-plugins have run). Files are written as:
+//   - <hash>.up.ail      – compact binary encoding of the upstream request
+//   - <hash>.up.ail.txt  – human-readable disassembly of the upstream request
+func trySampleAILUpstream(reqHash string, prog *ail.Program, logger *zap.Logger) {
+	if sampleAILDir == "" || reqHash == "" || prog == nil {
+		return
+	}
+
+	binPath := filepath.Join(sampleAILDir, reqHash+".up.ail")
+
+	var buf bytes.Buffer
+	if err := prog.Encode(&buf); err != nil {
+		logger.Error("SAMPLE_AIL: upstream binary encode failed", zap.Error(err))
+		return
+	}
+	if err := os.WriteFile(binPath, buf.Bytes(), 0o644); err != nil {
+		logger.Error("SAMPLE_AIL: write upstream binary failed", zap.String("path", binPath), zap.Error(err))
+		return
+	}
+
+	txtPath := filepath.Join(sampleAILDir, reqHash+".up.ail.txt")
+	if err := os.WriteFile(txtPath, []byte(prog.Disasm()), 0o644); err != nil {
+		logger.Error("SAMPLE_AIL: write upstream disasm failed", zap.String("path", txtPath), zap.Error(err))
+		return
+	}
+
+	logger.Debug("SAMPLE_AIL: saved upstream request", zap.String("hash", reqHash), zap.String("dir", sampleAILDir))
 }
 
 // trySampleAILResponse persists a response AIL program paired with the request

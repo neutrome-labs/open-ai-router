@@ -115,6 +115,11 @@ func (m *AILModule) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	// Determine output format from Accept header (default: same as input)
 	wantBinaryOutput := m.wantBinaryOutput(r, inputBinary)
 
+	// Sample AIL to disk when SAMPLE_AIL is set
+	if hash := trySampleAIL(body, prog, m.logger); hash != "" {
+		r = r.WithContext(context.WithValue(r.Context(), ctxKeySampleHash, hash))
+	}
+
 	// Route through the provider pipeline
 	resProg, err := m.handleAILRequest(prog, w, r)
 	if err != nil {
@@ -126,6 +131,11 @@ func (m *AILModule) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 	if resProg == nil {
 		http.Error(w, "no response from providers", http.StatusBadGateway)
 		return nil
+	}
+
+	// Sample response AIL
+	if hash, ok := r.Context().Value(ctxKeySampleHash).(string); ok {
+		trySampleAILResponse(hash, resProg, m.logger)
 	}
 
 	// Encode the response
@@ -251,6 +261,11 @@ func (m *AILModule) handleAILRequest(
 			continue
 		}
 		providerProg = processedProg
+
+		// Sample the upstream-prepared AIL (after model resolve + plugins)
+		if hash, ok := r.Context().Value(ctxKeySampleHash).(string); ok {
+			trySampleAILUpstream(hash, providerProg, m.logger)
+		}
 
 		// Set response headers
 		w.Header().Set("X-Real-Provider-Id", name)
