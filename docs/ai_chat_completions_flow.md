@@ -106,6 +106,7 @@ sequenceDiagram
     
     ServeHTTP->>Plugins: RunRecursiveHandlers()
     alt Plugin handles request
+        Note over Plugins: e.g. +dspy (DSPy bridge),<br/>tool_plugin (tool dispatch)
         Plugins-->>Client: Plugin-generated response
     else No recursive handler
         ServeHTTP->>HandleReq: handleRequest()

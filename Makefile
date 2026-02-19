@@ -1,4 +1,4 @@
-.PHONY: build run clean tidy test test-formats test-styles test-plugins test-all test-server
+.PHONY: build run clean tidy test test-formats test-styles test-plugins test-all test-server dspy-sidecar dspy-sidecar-install
 
 build:
 	go build -o caddy ./src
@@ -57,3 +57,13 @@ test-coverage:
 # Run tests in short mode (skip slow tests)
 test-short:
 	go test -v ./src/... -short -count=1
+
+# ─── DSPy Sidecar ─────────────────────────────────────────────────────────────
+
+# Install sidecar Python dependencies
+dspy-sidecar-install:
+	pip3 install -r sidecar/requirements.txt
+
+# Start the DSPy sidecar process
+dspy-sidecar:
+	python3 sidecar/dspy_sidecar.py

@@ -40,6 +40,50 @@ AIL (Raw)               | Full    | Full
 
 ### stools
 
+### dspy
+
+The `dspy` plugin delegates inference to a Python DSPy sidecar, enabling DSPy modules (ChainOfThought, ReAct, Predict, RLM) as transparent plugins.
+
+**Syntax:** `model+dspy`, `model+dspy:kind`, or `model+dspy:kind:signature`
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `kind` | `cot` | DSPy module: `predict`, `cot`, `react`, `rlm` |
+| `signature` | `history, question -> answer` | DSPy signature (URL-encoded if special chars) |
+
+**Usage examples:**
+```bash
+# Default Chain of Thought
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -d '{"model": "gpt-4o-mini+dspy", "messages": [{"role": "user", "content": "What is 2+2?"}]}'
+
+# ReAct agent with tools
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -d '{"model": "gpt-4o+dspy:react", "messages": [{"role": "user", "content": "Search for..."}], "tools": [...]}'
+
+# Custom signature
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -d '{"model": "gpt-4o+dspy:cot:context,%20question%20->%20answer", "messages": [...]}'
+```
+
+**Environment variables:**
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DSPY_SIDECAR_URL` | `http://localhost:8780` | Sidecar base URL |
+| `DSPY_TIMEOUT` | `120s` | Request timeout |
+
+**Setup:**
+```bash
+# Install and start the sidecar
+make dspy-sidecar-install
+make dspy-sidecar
+
+# In another terminal, start the router
+make run
+```
+
+See [docs/dspy_plugin.md](docs/dspy_plugin.md) for architecture details.
+
 # ail
 
 The `ail` directive exposes a raw AIL (AI Intermediate Language) endpoint. You can POST AIL programs directly — in binary (`.ail`) or text (`.ail.txt`) format — and receive inference responses in the same format.

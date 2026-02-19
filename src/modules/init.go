@@ -2,10 +2,13 @@
 package modules
 
 import (
+	"os"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/neutrome-labs/open-ai-router/src/plugin"
 	"github.com/neutrome-labs/open-ai-router/src/plugins"
+	"github.com/neutrome-labs/open-ai-router/src/plugins/dspy"
 	"github.com/neutrome-labs/open-ai-router/src/plugins/flow"
 	"github.com/neutrome-labs/open-ai-router/src/services"
 )
@@ -19,6 +22,14 @@ func init() {
 	plugin.RegisterPlugin("stools", &plugins.StripTools{})
 	plugin.RegisterPlugin("slwin", &plugins.SlidingWindow{})
 	plugin.RegisterPlugin("kvtools", plugins.NewKvTools())
+	plugin.RegisterPlugin("dspy", &dspy.DSPy{})
+
+	// Auto-enable the sampler when the SAMPLER env var points to a directory.
+	if dir := os.Getenv("SAMPLER"); dir != "" {
+		s := plugins.NewSampler(dir)
+		plugin.RegisterPlugin("sampler", s)
+		plugin.TailPlugins = append(plugin.TailPlugins, [2]string{"sampler", ""})
+	}
 
 	defer func() {
 		_ = services.FireObservabilityEvent("app", "", "init", map[string]any{

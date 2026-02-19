@@ -1,6 +1,8 @@
 .vscode/
 .idea/
 
+.venv/
+
 samples/
 
 .env
