@@ -47,6 +47,16 @@ type ModelRewritePlugin interface {
 	RewriteModel(model string) (rewritten string, matched bool)
 }
 
+// RequestInitPlugin is called once per request after the initial AIL program
+// is parsed and plugin resolution is complete, but before provider iteration.
+// Ideal for sampling and observability hooks that need the pre-plugin state.
+type RequestInitPlugin interface {
+	Plugin
+	// OnRequestInit receives the original parsed program before any
+	// provider-specific before-plugins mutate it.
+	OnRequestInit(r *http.Request, prog *ail.Program)
+}
+
 // BeforePlugin processes requests before sending to provider.
 // Operates on the AIL program representation.
 type BeforePlugin interface {

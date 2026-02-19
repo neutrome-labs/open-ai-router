@@ -128,6 +128,17 @@ func (c *PluginChain) RunModelRewrite(model string) (string, string) {
 	return model, ""
 }
 
+// RunRequestInit executes all RequestInitPlugin implementations.
+// Called once per request after parsing and plugin resolution, before provider iteration.
+func (c *PluginChain) RunRequestInit(r *http.Request, prog *ail.Program) {
+	for _, pi := range c.plugins {
+		if rip, ok := pi.Plugin.(RequestInitPlugin); ok {
+			Logger.Debug("Running RequestInit plugin", zap.String("plugin", pi.Plugin.Name()))
+			rip.OnRequestInit(r, prog)
+		}
+	}
+}
+
 // RunRecursiveHandlers executes all RecursiveHandlerPlugin implementations.
 func (c *PluginChain) RunRecursiveHandlers(invoker HandlerInvoker, prog *ail.Program, w http.ResponseWriter, r *http.Request) (bool, error) {
 	Logger.Debug("RunRecursiveHandlers starting", zap.Int("plugin_count", len(c.plugins)))

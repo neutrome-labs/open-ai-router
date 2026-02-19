@@ -109,11 +109,6 @@ func RunInferencePipeline(
 		}
 		providerProg = processedProg
 
-		// Sample the upstream-prepared AIL (after model resolve + plugins).
-		if hash, ok := r.Context().Value(ctxKeySampleHash).(string); ok {
-			trySampleAILUpstream(hash, providerProg, logger)
-		}
-
 		logger.Debug("Executing inference",
 			zap.String("provider", name),
 			zap.String("style", string(p.Impl.Style)),

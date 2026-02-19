@@ -1,14 +1,9 @@
 package server
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"io"
 	"net/http"
-	"os"
-	"path/filepath"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
@@ -24,15 +19,6 @@ import (
 	"github.com/neutrome-labs/open-ai-router/src/sse"
 	"go.uber.org/zap"
 )
-
-// sampleAILDir is the directory to dump AIL programs into.
-// Set via the SAMPLE_AIL environment variable at startup.
-var sampleAILDir = os.Getenv("SAMPLE_AIL")
-
-// ctxKeySampleHash is the context key for the request sample hash (used to pair response samples).
-type sampleHashKey struct{}
-
-var ctxKeySampleHash = sampleHashKey{}
 
 // ChatCompletionsModule handles OpenAI-style chat completions requests.
 // AIL rework: all data passes through *ail.Program, no more styles.PartialJSON.
@@ -107,11 +93,6 @@ func (m *ChatCompletionsModule) serveChatCompletions(
 		return nil
 	}
 
-	// Sample response AIL
-	if hash, ok := r.Context().Value(ctxKeySampleHash).(string); ok {
-		trySampleAILResponse(hash, resProg, m.logger)
-	}
-
 	// Emit response as Chat Completions JSON
 	resData, err := responseEmitter.EmitResponse(resProg)
 	if err != nil {
@@ -159,10 +140,8 @@ func (m *ChatCompletionsModule) serveChatCompletionsStream(
 		return err
 	}
 
-	// StreamAssembler accumulates all chunk programs into a complete response
-	// for sampling and the StreamEnd plugin hook.
+	// Accumulate chunks for assembly into a complete response for StreamEnd.
 	chunks := make([]*ail.Program, 0, 10)
-	var lastChunk *ail.Program
 
 	for chunk := range stream {
 		if chunk.RuntimeError != nil {
@@ -181,7 +160,6 @@ func (m *ChatCompletionsModule) serveChatCompletionsStream(
 		}
 
 		if chunkProg != nil {
-			lastChunk = chunkProg
 			chunks = append(chunks, chunkProg)
 
 			// Convert chunk to client format via StreamConverter.
@@ -215,9 +193,6 @@ func (m *ChatCompletionsModule) serveChatCompletionsStream(
 		}
 	}
 
-	// Run stream end plugins
-	_ = chain.RunStreamEnd(&p.Impl, r, prog, hres, lastChunk)
-
 	// Assemble all chunk programs into a single response program.
 	assembled := ail.NewProgram()
 	for _, c := range chunks {
@@ -226,10 +201,8 @@ func (m *ChatCompletionsModule) serveChatCompletionsStream(
 		}
 	}
 
-	// Sample the assembled complete response (all chunks, not just last)
-	if hash, ok := r.Context().Value(ctxKeySampleHash).(string); ok {
-		trySampleAILResponse(hash, assembled, m.logger)
-	}
+	// Run stream end plugins with the fully assembled response.
+	_ = chain.RunStreamEnd(&p.Impl, r, prog, hres, assembled)
 
 	_ = sseWriter.WriteDone()
 	return nil
@@ -261,10 +234,6 @@ func (m *ChatCompletionsModule) ServeHTTP(w http.ResponseWriter, r *http.Request
 			return nil
 		}
 
-		// Sample AIL to disk when SAMPLE_AIL is set
-		if hash := trySampleAIL(reqBody, prog, m.logger); hash != "" {
-			r = r.WithContext(context.WithValue(r.Context(), ctxKeySampleHash, hash))
-		}
 	}
 
 	m.logger.Debug("Request parsed",
@@ -286,6 +255,9 @@ func (m *ChatCompletionsModule) ServeHTTP(w http.ResponseWriter, r *http.Request
 
 	traceId := uuid.New().String()
 	r = r.WithContext(context.WithValue(r.Context(), plugin.ContextTraceID(), traceId))
+
+	// Notify plugins of the initial parsed request (e.g., sampler).
+	chain.RunRequestInit(r, prog)
 
 	// Create invoker for recursive handler plugins (fallback, parallel, etc.)
 	invoker := plugin.NewCaddyModuleInvoker(m, requestParser)
@@ -346,118 +318,7 @@ func (m *ChatCompletionsModule) handleRequest(
 	return RunInferencePipeline(router, chain, prog, w, r, m, m.logger)
 }
 
-// trySampleAIL persists the AIL program to sampleAILDir when SAMPLE_AIL is set.
-// Files are keyed by the SHA-256 of the raw request body so duplicates are
-// deduplicated automatically. Each request produces up to 6 files:
-//   - <hash>.ail         – compact binary encoding of the original request
-//   - <hash>.ail.txt     – human-readable disassembly of the original request
-//   - <hash>.up.ail      – compact binary encoding of the upstream-prepared request
-//   - <hash>.up.ail.txt  – human-readable disassembly of the upstream-prepared request
-//   - <hash>.res.ail     – compact binary encoding of the response
-//   - <hash>.res.ail.txt – human-readable disassembly of the response
-//
-// Returns the hex hash so callers can pair upstream/response samples with the same key.
-func trySampleAIL(reqBody []byte, prog *ail.Program, logger *zap.Logger) string {
-	if sampleAILDir == "" {
-		return ""
-	}
-
-	// Ensure the directory exists (once per unique path, mkdir is idempotent)
-	if err := os.MkdirAll(sampleAILDir, 0o755); err != nil {
-		logger.Error("SAMPLE_AIL: failed to create directory", zap.String("dir", sampleAILDir), zap.Error(err))
-		return ""
-	}
-
-	hash := sha256.Sum256(reqBody)
-	name := hex.EncodeToString(hash[:])
-
-	// Binary encoding
-	binPath := filepath.Join(sampleAILDir, name+".ail")
-	if _, err := os.Stat(binPath); err == nil {
-		// Already sampled this exact request — still return name for response pairing
-		return name
-	}
-
-	var buf bytes.Buffer
-	if err := prog.Encode(&buf); err != nil {
-		logger.Error("SAMPLE_AIL: binary encode failed", zap.Error(err))
-		return name
-	}
-	if err := os.WriteFile(binPath, buf.Bytes(), 0o644); err != nil {
-		logger.Error("SAMPLE_AIL: write binary failed", zap.String("path", binPath), zap.Error(err))
-		return name
-	}
-
-	// Human-readable disassembly
-	txtPath := filepath.Join(sampleAILDir, name+".ail.txt")
-	if err := os.WriteFile(txtPath, []byte(prog.Disasm()), 0o644); err != nil {
-		logger.Error("SAMPLE_AIL: write disasm failed", zap.String("path", txtPath), zap.Error(err))
-		return name
-	}
-
-	logger.Debug("SAMPLE_AIL: saved request", zap.String("hash", name), zap.String("dir", sampleAILDir))
-	return name
-}
-
-// trySampleAILUpstream persists the fully-prepared upstream request AIL program
-// (after model resolution and all before-plugins have run). Files are written as:
-//   - <hash>.up.ail      – compact binary encoding of the upstream request
-//   - <hash>.up.ail.txt  – human-readable disassembly of the upstream request
-func trySampleAILUpstream(reqHash string, prog *ail.Program, logger *zap.Logger) {
-	if sampleAILDir == "" || reqHash == "" || prog == nil {
-		return
-	}
-
-	binPath := filepath.Join(sampleAILDir, reqHash+".up.ail")
-
-	var buf bytes.Buffer
-	if err := prog.Encode(&buf); err != nil {
-		logger.Error("SAMPLE_AIL: upstream binary encode failed", zap.Error(err))
-		return
-	}
-	if err := os.WriteFile(binPath, buf.Bytes(), 0o644); err != nil {
-		logger.Error("SAMPLE_AIL: write upstream binary failed", zap.String("path", binPath), zap.Error(err))
-		return
-	}
-
-	txtPath := filepath.Join(sampleAILDir, reqHash+".up.ail.txt")
-	if err := os.WriteFile(txtPath, []byte(prog.Disasm()), 0o644); err != nil {
-		logger.Error("SAMPLE_AIL: write upstream disasm failed", zap.String("path", txtPath), zap.Error(err))
-		return
-	}
-
-	logger.Debug("SAMPLE_AIL: saved upstream request", zap.String("hash", reqHash), zap.String("dir", sampleAILDir))
-}
-
-// trySampleAILResponse persists a response AIL program paired with the request
-// that produced it. Files are written as:
-//   - <hash>.res.ail      – compact binary encoding of the response
-//   - <hash>.res.ail.txt  – human-readable disassembly of the response
-func trySampleAILResponse(reqHash string, prog *ail.Program, logger *zap.Logger) {
-	if sampleAILDir == "" || reqHash == "" || prog == nil {
-		return
-	}
-
-	binPath := filepath.Join(sampleAILDir, reqHash+".res.ail")
-
-	var buf bytes.Buffer
-	if err := prog.Encode(&buf); err != nil {
-		logger.Error("SAMPLE_AIL: response binary encode failed", zap.Error(err))
-		return
-	}
-	if err := os.WriteFile(binPath, buf.Bytes(), 0o644); err != nil {
-		logger.Error("SAMPLE_AIL: write response binary failed", zap.String("path", binPath), zap.Error(err))
-		return
-	}
-
-	txtPath := filepath.Join(sampleAILDir, reqHash+".res.ail.txt")
-	if err := os.WriteFile(txtPath, []byte(prog.Disasm()), 0o644); err != nil {
-		logger.Error("SAMPLE_AIL: write response disasm failed", zap.String("path", txtPath), zap.Error(err))
-		return
-	}
-
-	logger.Debug("SAMPLE_AIL: saved response", zap.String("hash", reqHash), zap.String("dir", sampleAILDir))
-}
+// trySampleAIL* functions have been moved to src/plugins/sampler.go.
 
 var (
 	_ caddy.Provisioner           = (*ChatCompletionsModule)(nil)

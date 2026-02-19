@@ -148,10 +148,6 @@ func (m *AILModule) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 		// Determine output format from Accept header (default: same as input).
 		wantBinaryOutput = m.wantBinaryOutput(r, inputBinary)
 
-		// Sample AIL to disk when SAMPLE_AIL is set.
-		if hash := trySampleAIL(body, prog, m.logger); hash != "" {
-			r = r.WithContext(context.WithValue(r.Context(), ctxKeySampleHash, hash))
-		}
 	}
 
 	// Store output format in context for InferenceHandler methods.
@@ -173,6 +169,9 @@ func (m *AILModule) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 
 	traceId := uuid.New().String()
 	r = r.WithContext(context.WithValue(r.Context(), plugin.ContextTraceID(), traceId))
+
+	// Notify plugins of the initial parsed request (e.g., sampler).
+	chain.RunRequestInit(r, prog)
 
 	// Recursive handler plugins (tool dispatch, fallback, parallel, etc.).
 	invoker := plugin.NewCaddyModuleInvoker(m, &ailResponseParser{})
@@ -219,11 +218,6 @@ func (m *AILModule) ServeNonStreaming(
 		return err
 	}
 
-	// Sample response AIL.
-	if hash, ok := r.Context().Value(ctxKeySampleHash).(string); ok {
-		trySampleAILResponse(hash, resProg, m.logger)
-	}
-
 	// Encode and write the response.
 	wantBinary, _ := r.Context().Value(ailOutputCtxKey{}).(bool)
 	return m.writeAILResponse(w, resProg, wantBinary)
@@ -258,7 +252,6 @@ func (m *AILModule) ServeStreaming(
 	wantBinary, _ := r.Context().Value(ailOutputCtxKey{}).(bool)
 
 	chunks := make([]*ail.Program, 0, 10)
-	var lastChunk *ail.Program
 
 	for chunk := range stream {
 		if chunk.RuntimeError != nil {
@@ -277,7 +270,6 @@ func (m *AILModule) ServeStreaming(
 		}
 
 		if chunkProg != nil {
-			lastChunk = chunkProg
 			chunks = append(chunks, chunkProg)
 
 			// Encode the chunk and push via SSE.
@@ -293,18 +285,14 @@ func (m *AILModule) ServeStreaming(
 		}
 	}
 
-	_ = chain.RunStreamEnd(&p.Impl, r, prog, hres, lastChunk)
-
-	// Sample the assembled complete response (all chunks).
+	// Assemble all chunk programs and pass the complete response to StreamEnd.
 	assembled := ail.NewProgram()
 	for _, c := range chunks {
 		if c != nil {
 			assembled = assembled.Append(c)
 		}
 	}
-	if hash, ok := r.Context().Value(ctxKeySampleHash).(string); ok {
-		trySampleAILResponse(hash, assembled, m.logger)
-	}
+	_ = chain.RunStreamEnd(&p.Impl, r, prog, hres, assembled)
 
 	_ = sseWriter.WriteDone()
 	return nil
