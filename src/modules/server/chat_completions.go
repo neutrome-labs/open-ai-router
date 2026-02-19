@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -162,7 +163,7 @@ func (m *ChatCompletionsModule) serveChatCompletionsStream(
 
 	// StreamAssembler accumulates all chunk programs into a complete response
 	// for sampling and the StreamEnd plugin hook.
-	asm := ail.NewStreamAssembler()
+	chunks := make([]*ail.Program, 0, 10)
 	var lastChunk *ail.Program
 
 	for chunk := range stream {
@@ -183,7 +184,7 @@ func (m *ChatCompletionsModule) serveChatCompletionsStream(
 
 		if chunkProg != nil {
 			lastChunk = chunkProg
-			asm.Push(chunkProg)
+			chunks = append(chunks, chunkProg)
 
 			// Convert chunk to client format via StreamConverter.
 			// PushProgram handles metadata tracking, tool buffering,
@@ -219,9 +220,23 @@ func (m *ChatCompletionsModule) serveChatCompletionsStream(
 	// Run stream end plugins
 	_ = chain.RunStreamEnd(&p.Impl, r, prog, hres, lastChunk)
 
+	disasm := ""
+	for i, c := range chunks {
+		if c == nil {
+			continue
+		}
+		disasm += fmt.Sprintf("# Chunk %d\n", i)
+		disasm += c.Disasm() + "\n"
+	}
+
+	asm, err := ail.Asm(disasm)
+	if err != nil {
+		m.logger.Error("failed to assemble streamed AIL", zap.Error(err))
+	}
+
 	// Sample the assembled complete response (all chunks, not just last)
 	if hash, ok := r.Context().Value(ctxKeySampleHash).(string); ok {
-		trySampleAILResponse(hash, asm.Program(), m.logger)
+		trySampleAILResponse(hash, asm, m.logger)
 	}
 
 	_ = sseWriter.WriteDone()

@@ -333,7 +333,7 @@ func (m *AILModule) doStreamingInference(
 		return nil, err
 	}
 
-	asm := ail.NewStreamAssembler()
+	chunks := make([]*ail.Program, 0)
 	var lastChunk *ail.Program
 
 	for chunk := range stream {
@@ -352,14 +352,29 @@ func (m *AILModule) doStreamingInference(
 
 		if chunkProg != nil {
 			lastChunk = chunkProg
-			asm.Push(chunkProg)
+			chunks = append(chunks, chunkProg)
 		}
 	}
 
 	// Run stream end plugins
 	_ = chain.RunStreamEnd(&p.Impl, r, prog, hres, lastChunk)
 
-	return asm.Program(), nil
+	disasm := ""
+	for i, c := range chunks {
+		if c == nil {
+			continue
+		}
+		disasm += fmt.Sprintf("# Chunk %d\n", i)
+		disasm += c.Disasm() + "\n"
+	}
+
+	asm, err := ail.Asm(disasm)
+	if err != nil {
+		m.logger.Error("failed to assemble streamed AIL", zap.Error(err))
+		return nil, fmt.Errorf("failed to assemble streamed AIL: %w", err)
+	}
+
+	return asm, nil
 }
 
 var (

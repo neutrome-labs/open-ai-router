@@ -13,7 +13,10 @@ tidy:
 	go mod tidy
 
 upgrade:
-	GOPRIVATE=github.com/neutrome-labs go get -u ./...
+	GOPRIVATE=github.com/neutrome-labs go get github.com/neutrome-labs/ail
+
+upgrade-all:
+	go get -u ./...
 	go mod tidy
 
 # Run all unit tests
