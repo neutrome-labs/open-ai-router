@@ -111,8 +111,9 @@ func (c *PluginChain) RunError(p *services.ProviderService, r *http.Request, req
 }
 
 // RunModelRewrite iterates ModelRewritePlugins and returns the first
-// successful rewrite. Returns the original model if nothing matched.
-func (c *PluginChain) RunModelRewrite(model string) string {
+// successful rewrite along with the name of the plugin that matched.
+// Returns the original model and an empty name if nothing matched.
+func (c *PluginChain) RunModelRewrite(model string) (string, string) {
 	for _, pi := range c.plugins {
 		if mr, ok := pi.Plugin.(ModelRewritePlugin); ok {
 			if rewritten, matched := mr.RewriteModel(model); matched {
@@ -120,11 +121,11 @@ func (c *PluginChain) RunModelRewrite(model string) string {
 					zap.String("plugin", pi.Plugin.Name()),
 					zap.String("from", model),
 					zap.String("to", rewritten))
-				return rewritten
+				return rewritten, pi.Plugin.Name()
 			}
 		}
 	}
-	return model
+	return model, ""
 }
 
 // RunRecursiveHandlers executes all RecursiveHandlerPlugin implementations.

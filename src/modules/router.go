@@ -11,6 +11,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/neutrome-labs/open-ai-router/src/drivers"
 	"github.com/neutrome-labs/open-ai-router/src/drivers/openai"
 	"github.com/neutrome-labs/open-ai-router/src/drivers/virtual"
 	"github.com/neutrome-labs/open-ai-router/src/plugin"
@@ -55,6 +56,8 @@ type ProviderConfig struct {
 	APIBaseURL    string            `json:"api_base_url,omitempty"`
 	Style         string            `json:"style,omitempty"`
 	ModelMappings map[string]string `json:"model_mappings,omitempty"` // For virtual providers: maps model name to target model spec
+	Exports       []string          `json:"exports,omitempty"`        // Optional: restrict which models this provider exposes
+	Private       bool              `json:"private,omitempty"`        // Mark provider as completely hidden; only usable as virtual upstream
 	Impl          services.ProviderService
 }
 
@@ -139,9 +142,28 @@ func (m *RouterModule) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 						virtualName := args[0]
 						targetModel := args[1]
 						p.ModelMappings[virtualName] = targetModel
+					case "exports":
+						// exports <model_id> [<model_id2> ...]
+						// Restricts which models this provider exposes externally.
+						// Can be specified multiple times; values accumulate.
+						args := d.RemainingArgs()
+						if len(args) == 0 {
+							return d.Errf("exports requires at least one model ID")
+						}
+						p.Exports = append(p.Exports, args...)
+					case "private":
+						// private
+						// Marks this provider as completely hidden from external access.
+						// No models are returned by /models and direct inference is rejected.
+						// The provider can still be used as an upstream target for virtual providers.
+						p.Private = true
 					default:
 						return d.Errf("unrecognized provider option '%s' for provider '%s'", d.Val(), providerName)
 					}
+				}
+				// private and exports are mutually exclusive
+				if p.Private && len(p.Exports) > 0 {
+					return d.Errf("provider %s: 'private' and 'exports' are mutually exclusive", providerName)
 				}
 				// Virtual providers don't need api_base_url
 				if p.Style != "virtual" && p.APIBaseURL == "" {
@@ -246,10 +268,34 @@ func (m *RouterModule) Provision(ctx caddy.Context) error {
 		}
 		p.Impl.Commands = providerCommands
 
+		// Apply private flag or build ExportedModels set.
+		// Both cases wrap list_models to filter output.
+		if p.Private {
+			p.Impl.Private = true
+			// Wrap list_models to return an empty list for private providers.
+			if inner, ok := providerCommands["list_models"].(drivers.ListModelsCommand); ok {
+				providerCommands["list_models"] = &drivers.ExportFilteredListModels{Inner: inner}
+			}
+		} else if len(p.Exports) > 0 {
+			exportSet := make(map[string]bool, len(p.Exports))
+			for _, modelID := range p.Exports {
+				exportSet[modelID] = true
+			}
+			p.Impl.ExportedModels = exportSet
+
+			// Wrap the list_models command so every consumer (fuzz, /models, etc.)
+			// automatically sees only the exported models.
+			if inner, ok := providerCommands["list_models"].(drivers.ListModelsCommand); ok {
+				providerCommands["list_models"] = &drivers.ExportFilteredListModels{Inner: inner}
+			}
+		}
+
 		m.Impl.Logger.Info("Provisioned provider",
 			zap.String("name", name),
 			zap.String("base_url", p.APIBaseURL),
-			zap.String("style", string(providerStyle)))
+			zap.String("style", string(providerStyle)),
+			zap.Int("exports_count", len(p.Exports)),
+			zap.Bool("private", p.Private))
 	}
 
 	// Expose providers to plugins (fuzz, etc.) without circular imports.

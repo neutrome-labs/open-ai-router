@@ -3,7 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
-	"fmt"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"strings"
@@ -14,10 +14,17 @@ import (
 	"github.com/google/uuid"
 	"github.com/neutrome-labs/ail"
 	"github.com/neutrome-labs/open-ai-router/src/drivers"
+	"github.com/neutrome-labs/open-ai-router/src/drivers/openai"
+	"github.com/neutrome-labs/open-ai-router/src/drivers/virtual"
 	"github.com/neutrome-labs/open-ai-router/src/modules"
 	"github.com/neutrome-labs/open-ai-router/src/plugin"
+	"github.com/neutrome-labs/open-ai-router/src/sse"
 	"go.uber.org/zap"
 )
+
+// ailOutputCtxKey carries the desired output encoding (binary vs text)
+// through the request context so ServeNonStreaming/ServeStreaming can read it.
+type ailOutputCtxKey struct{}
 
 // AILModule handles raw AIL (AI Intermediate Language) requests over HTTP.
 //
@@ -29,6 +36,15 @@ import (
 //   - Content-Type: text/plain         → text (disassembly) AIL input
 //   - Accept: application/x-ail        → binary AIL output (default)
 //   - Accept: text/plain               → text (disassembly) AIL output
+//
+// Streaming: when the program contains SET_STREAM, the response is pushed
+// incrementally as SSE events (text/event-stream). Each data event carries
+// one AIL chunk program in text disasm (Accept: text/plain) or base64-encoded
+// binary (Accept: application/x-ail). The stream ends with [DONE].
+//
+// Recursive handlers: plugins that implement RecursiveHandlerPlugin (e.g.
+// ToolPlugin for on-router tool dispatch) are fully supported, including
+// streaming requests via the hybrid buffer-then-stream approach.
 //
 // If Content-Type is absent or unrecognized, the handler auto-detects:
 // binary if the body starts with the AIL magic bytes ("AIL\x00"), text otherwise.
@@ -64,6 +80,13 @@ func (*AILModule) CaddyModule() caddy.ModuleInfo {
 
 func (m *AILModule) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger(m)
+
+	// Provision package-level loggers so that plugins, drivers, and virtual
+	// providers log correctly when only the AIL endpoint is used.
+	plugin.Logger = m.logger.Named("plugin")
+	openai.Logger = m.logger.Named("openai")
+	virtual.Logger = m.logger.Named("virtual")
+
 	return nil
 }
 
@@ -73,90 +96,252 @@ var ailMagic = []byte("AIL\x00")
 func (m *AILModule) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	m.logger.Debug("AIL request received", zap.String("method", r.Method))
 
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		m.logger.Error("failed to read request body", zap.Error(err))
-		http.Error(w, "failed to read request body", http.StatusBadRequest)
-		return nil
-	}
-
-	if len(body) == 0 {
-		http.Error(w, "empty request body", http.StatusBadRequest)
-		return nil
-	}
-
-	// Determine input format
-	inputBinary := m.isInputBinary(r, body)
-
-	// Parse the AIL program
 	var prog *ail.Program
-	if inputBinary {
-		prog, err = ail.Decode(bytes.NewReader(body))
-		if err != nil {
-			m.logger.Error("failed to decode binary AIL", zap.Error(err))
-			http.Error(w, "invalid binary AIL: "+err.Error(), http.StatusBadRequest)
-			return nil
-		}
+	var wantBinaryOutput bool
+
+	// Check if an AIL program is already in context (recursive call from plugin).
+	if ctxProg, ok := ail.ProgramFromContext(r.Context()); ok {
+		prog = ctxProg
+		m.logger.Debug("Using AIL program from context (recursive call)")
+		// Use text output for internal recursive calls — simpler to parse back,
+		// no base64 overhead, and the response stays in-process anyway.
+		wantBinaryOutput = false
 	} else {
-		prog, err = ail.Asm(string(body))
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			m.logger.Error("failed to assemble text AIL", zap.Error(err))
-			http.Error(w, "invalid AIL text: "+err.Error(), http.StatusBadRequest)
+			m.logger.Error("failed to read request body", zap.Error(err))
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
 			return nil
+		}
+
+		if len(body) == 0 {
+			http.Error(w, "empty request body", http.StatusBadRequest)
+			return nil
+		}
+
+		// Determine input format.
+		inputBinary := m.isInputBinary(r, body)
+
+		// Parse the AIL program.
+		if inputBinary {
+			prog, err = ail.Decode(bytes.NewReader(body))
+			if err != nil {
+				m.logger.Error("failed to decode binary AIL", zap.Error(err))
+				http.Error(w, "invalid binary AIL: "+err.Error(), http.StatusBadRequest)
+				return nil
+			}
+		} else {
+			prog, err = ail.Asm(string(body))
+			if err != nil {
+				m.logger.Error("failed to assemble text AIL", zap.Error(err))
+				http.Error(w, "invalid AIL text: "+err.Error(), http.StatusBadRequest)
+				return nil
+			}
+		}
+
+		m.logger.Debug("AIL program parsed",
+			zap.String("model", prog.GetModel()),
+			zap.Bool("streaming", prog.IsStreaming()),
+			zap.Int("instructions", prog.Len()),
+			zap.Bool("input_binary", inputBinary))
+
+		// Determine output format from Accept header (default: same as input).
+		wantBinaryOutput = m.wantBinaryOutput(r, inputBinary)
+
+		// Sample AIL to disk when SAMPLE_AIL is set.
+		if hash := trySampleAIL(body, prog, m.logger); hash != "" {
+			r = r.WithContext(context.WithValue(r.Context(), ctxKeySampleHash, hash))
 		}
 	}
 
-	m.logger.Debug("AIL program parsed",
-		zap.String("model", prog.GetModel()),
-		zap.Bool("streaming", prog.IsStreaming()),
-		zap.Int("instructions", prog.Len()),
-		zap.Bool("input_binary", inputBinary))
+	// Store output format in context for InferenceHandler methods.
+	r = r.WithContext(context.WithValue(r.Context(), ailOutputCtxKey{}, wantBinaryOutput))
 
-	// Determine output format from Accept header (default: same as input)
-	wantBinaryOutput := m.wantBinaryOutput(r, inputBinary)
-
-	// Sample AIL to disk when SAMPLE_AIL is set
-	if hash := trySampleAIL(body, prog, m.logger); hash != "" {
-		r = r.WithContext(context.WithValue(r.Context(), ctxKeySampleHash, hash))
+	router, ok := modules.GetRouter(m.RouterName)
+	if !ok {
+		m.logger.Error("Router not found", zap.String("name", m.RouterName))
+		http.Error(w, "Router not found", http.StatusInternalServerError)
+		return nil
 	}
 
-	// Route through the provider pipeline
-	resProg, err := m.handleAILRequest(prog, w, r)
+	// Shared preamble: auth, model rewrite, plugin resolution.
+	chain, r, err := RequestPreamble(router, prog, r, m.logger)
 	if err != nil {
+		http.Error(w, "authentication error", http.StatusUnauthorized)
+		return nil
+	}
+
+	traceId := uuid.New().String()
+	r = r.WithContext(context.WithValue(r.Context(), plugin.ContextTraceID(), traceId))
+
+	// Recursive handler plugins (tool dispatch, fallback, parallel, etc.).
+	invoker := plugin.NewCaddyModuleInvoker(m, &ailResponseParser{})
+	handled, err := chain.RunRecursiveHandlers(invoker, prog, w, r)
+	if handled {
+		if err != nil {
+			m.logger.Error("recursive handler plugin failed", zap.Error(err))
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return nil
+	}
+
+	// Normal flow — shared provider iteration pipeline.
+	if err := RunInferencePipeline(router, chain, prog, w, r, m, m.logger); err != nil {
 		m.logger.Error("AIL request handling failed", zap.Error(err))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return nil
 	}
 
-	if resProg == nil {
-		http.Error(w, "no response from providers", http.StatusBadGateway)
-		return nil
+	return nil
+}
+
+// ─── InferenceHandler implementation ─────────────────────────────────────────
+
+// ServeNonStreaming implements InferenceHandler for AIL.
+func (m *AILModule) ServeNonStreaming(
+	p *modules.ProviderConfig,
+	cmd drivers.InferenceCommand,
+	chain *plugin.PluginChain,
+	prog *ail.Program,
+	w http.ResponseWriter,
+	r *http.Request,
+) error {
+	res, resProg, err := cmd.DoInference(&p.Impl, prog, r)
+	if err != nil {
+		m.logger.Error("inference error", zap.String("provider", p.Name), zap.Error(err))
+		_ = chain.RunError(&p.Impl, r, prog, res, err)
+		return err
 	}
 
-	// Sample response AIL
+	resProg, err = chain.RunAfter(&p.Impl, r, prog, res, resProg)
+	if err != nil {
+		m.logger.Error("plugin after hook error", zap.Error(err))
+		return err
+	}
+
+	// Sample response AIL.
 	if hash, ok := r.Context().Value(ctxKeySampleHash).(string); ok {
 		trySampleAILResponse(hash, resProg, m.logger)
 	}
 
-	// Encode the response
-	if wantBinaryOutput {
-		w.Header().Set("Content-Type", "application/x-ail")
-		var buf bytes.Buffer
-		if err := resProg.Encode(&buf); err != nil {
-			m.logger.Error("failed to encode binary AIL response", zap.Error(err))
-			http.Error(w, "response encoding error", http.StatusInternalServerError)
-			return nil
-		}
-		_, err = w.Write(buf.Bytes())
-	} else {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, err = io.WriteString(w, resProg.Disasm())
+	// Encode and write the response.
+	wantBinary, _ := r.Context().Value(ailOutputCtxKey{}).(bool)
+	return m.writeAILResponse(w, resProg, wantBinary)
+}
+
+// ServeStreaming implements InferenceHandler for AIL.
+// Pushes AIL chunk programs to the client incrementally via SSE.
+func (m *AILModule) ServeStreaming(
+	p *modules.ProviderConfig,
+	cmd drivers.InferenceCommand,
+	chain *plugin.PluginChain,
+	prog *ail.Program,
+	w http.ResponseWriter,
+	r *http.Request,
+) error {
+	sseWriter := sse.NewWriter(w)
+
+	if err := sseWriter.WriteHeartbeat("ok"); err != nil {
+		return err
 	}
 
+	hres, stream, err := cmd.DoInferenceStream(&p.Impl, prog, r)
 	if err != nil {
-		m.logger.Error("failed to write AIL response", zap.Error(err))
+		m.logger.Error("inference stream error (start)",
+			zap.String("provider", p.Name), zap.Error(err))
+		_ = chain.RunError(&p.Impl, r, prog, hres, err)
+		_ = sseWriter.WriteError("start failed")
+		_ = sseWriter.WriteDone()
+		return err
 	}
+
+	wantBinary, _ := r.Context().Value(ailOutputCtxKey{}).(bool)
+
+	chunks := make([]*ail.Program, 0, 10)
+	var lastChunk *ail.Program
+
+	for chunk := range stream {
+		if chunk.RuntimeError != nil {
+			_ = sseWriter.WriteError(chunk.RuntimeError.Error())
+			_ = chain.RunError(&p.Impl, r, prog, hres, chunk.RuntimeError)
+			return nil
+		}
+
+		chunkProg := chunk.Data
+
+		// Run after-chunk plugins (may modify the AIL program).
+		chunkProg, err = chain.RunAfterChunk(&p.Impl, r, prog, hres, chunkProg)
+		if err != nil {
+			m.logger.Error("plugin after chunk error", zap.Error(err))
+			continue
+		}
+
+		if chunkProg != nil {
+			lastChunk = chunkProg
+			chunks = append(chunks, chunkProg)
+
+			// Encode the chunk and push via SSE.
+			chunkData, encErr := m.encodeAILChunk(chunkProg, wantBinary)
+			if encErr != nil {
+				m.logger.Error("chunk encode error", zap.Error(encErr))
+				continue
+			}
+			if err := sseWriter.WriteRaw(chunkData); err != nil {
+				m.logger.Error("stream write error", zap.Error(err))
+				return err
+			}
+		}
+	}
+
+	_ = chain.RunStreamEnd(&p.Impl, r, prog, hres, lastChunk)
+
+	// Sample the assembled complete response (all chunks).
+	assembled := ail.NewProgram()
+	for _, c := range chunks {
+		if c != nil {
+			assembled = assembled.Append(c)
+		}
+	}
+	if hash, ok := r.Context().Value(ctxKeySampleHash).(string); ok {
+		trySampleAILResponse(hash, assembled, m.logger)
+	}
+
+	_ = sseWriter.WriteDone()
 	return nil
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// writeAILResponse encodes an AIL program and writes it to the response writer.
+func (m *AILModule) writeAILResponse(w http.ResponseWriter, prog *ail.Program, wantBinary bool) error {
+	if wantBinary {
+		w.Header().Set("Content-Type", "application/x-ail")
+		var buf bytes.Buffer
+		if err := prog.Encode(&buf); err != nil {
+			m.logger.Error("failed to encode binary AIL response", zap.Error(err))
+			return err
+		}
+		_, err := w.Write(buf.Bytes())
+		return err
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, err := io.WriteString(w, prog.Disasm())
+	return err
+}
+
+// encodeAILChunk encodes a single AIL chunk program for SSE delivery.
+// Text mode: returns the disasm directly.
+// Binary mode: base64-encodes the binary AIL (SSE is text-based).
+func (m *AILModule) encodeAILChunk(prog *ail.Program, wantBinary bool) ([]byte, error) {
+	if !wantBinary {
+		return []byte(prog.Disasm()), nil
+	}
+	var buf bytes.Buffer
+	if err := prog.Encode(&buf); err != nil {
+		return nil, err
+	}
+	encoded := base64.StdEncoding.EncodeToString(buf.Bytes())
+	return []byte(encoded), nil
 }
 
 // isInputBinary determines whether the request body is binary AIL or text.
@@ -187,190 +372,25 @@ func (m *AILModule) wantBinaryOutput(r *http.Request, inputBinary bool) bool {
 	}
 }
 
-// handleAILRequest runs the AIL program through the provider pipeline and
-// returns the response as an AIL program.
-//
-// If the request has SET_STREAM, streaming is performed internally and all
-// chunks are assembled into a complete response program.
-func (m *AILModule) handleAILRequest(
-	prog *ail.Program,
-	w http.ResponseWriter,
-	r *http.Request,
-) (*ail.Program, error) {
-	router, ok := modules.GetRouter(m.RouterName)
-	if !ok {
-		m.logger.Error("Router not found", zap.String("name", m.RouterName))
-		return nil, fmt.Errorf("router %q not found", m.RouterName)
+// ─── AIL Response Parser ─────────────────────────────────────────────────────
+
+// ailResponseParser implements plugin.ResponseParser for the AIL wire format.
+// Auto-detects binary AIL (magic header) vs text (disassembly) and parses accordingly.
+// Used by CaddyModuleInvoker when the AIL module is invoked recursively.
+type ailResponseParser struct{}
+
+func (p *ailResponseParser) ParseResponse(data []byte) (*ail.Program, error) {
+	// Binary AIL starts with the magic header.
+	if len(data) >= 4 && bytes.Equal(data[:4], ailMagic) {
+		return ail.Decode(bytes.NewReader(data))
 	}
-
-	// Collect incoming auth
-	r, err := router.Impl.Auth.CollectIncomingAuth(r)
-	if err != nil {
-		m.logger.Error("failed to collect incoming auth", zap.Error(err))
-		return nil, fmt.Errorf("authentication error: %w", err)
-	}
-
-	// Resolve virtual model aliases
-	model := prog.GetModel()
-	var chain *plugin.PluginChain
-	const maxRewriteDepth = 10
-	for i := 0; i < maxRewriteDepth; i++ {
-		chain = plugin.TryResolvePlugins(*r.URL, model)
-		if rewritten := chain.RunModelRewrite(model); rewritten != model {
-			m.logger.Debug("Virtual model resolved",
-				zap.String("from", model),
-				zap.String("to", rewritten))
-			model = rewritten
-			continue
-		}
-		break
-	}
-	prog.SetModel(model)
-
-	traceId := uuid.New().String()
-	r = r.WithContext(context.WithValue(r.Context(), plugin.ContextTraceID(), traceId))
-
-	// Resolve providers
-	providers, resolvedModel := router.ResolveProvidersOrderAndModel(prog.GetModel())
-
-	m.logger.Debug("AIL resolved providers",
-		zap.String("model", resolvedModel),
-		zap.Strings("providers", providers))
-
-	var lastErr error
-	for _, name := range providers {
-		p, ok := router.ProviderConfigs[name]
-		if !ok {
-			m.logger.Error("provider not found", zap.String("name", name))
-			continue
-		}
-
-		cmd, ok := p.Impl.Commands["inference"].(drivers.InferenceCommand)
-		if !ok {
-			continue
-		}
-
-		providerProg := prog.Clone()
-		providerProg.SetModel(resolvedModel)
-
-		// Run before plugins
-		processedProg, err := chain.RunBefore(&p.Impl, r, providerProg)
-		if err != nil {
-			m.logger.Error("plugin before hook error", zap.String("provider", name), zap.Error(err))
-			lastErr = err
-			continue
-		}
-		providerProg = processedProg
-
-		// Sample the upstream-prepared AIL (after model resolve + plugins)
-		if hash, ok := r.Context().Value(ctxKeySampleHash).(string); ok {
-			trySampleAILUpstream(hash, providerProg, m.logger)
-		}
-
-		// Set response headers
-		w.Header().Set("X-Real-Provider-Id", name)
-		w.Header().Set("X-Real-Model-Id", resolvedModel)
-
-		var resProg *ail.Program
-
-		if providerProg.IsStreaming() {
-			resProg, err = m.doStreamingInference(p, cmd, chain, providerProg, r)
-		} else {
-			resProg, err = m.doNonStreamingInference(p, cmd, chain, providerProg, r)
-		}
-
-		if err != nil {
-			lastErr = err
-			continue
-		}
-
-		return resProg, nil
-	}
-
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, nil
-}
-
-// doNonStreamingInference performs non-streaming inference and returns the response AIL program.
-func (m *AILModule) doNonStreamingInference(
-	p *modules.ProviderConfig,
-	cmd drivers.InferenceCommand,
-	chain *plugin.PluginChain,
-	prog *ail.Program,
-	r *http.Request,
-) (*ail.Program, error) {
-	res, resProg, err := cmd.DoInference(&p.Impl, prog, r)
-	if err != nil {
-		m.logger.Error("inference error", zap.String("provider", p.Name), zap.Error(err))
-		_ = chain.RunError(&p.Impl, r, prog, res, err)
-		return nil, err
-	}
-
-	resProg, err = chain.RunAfter(&p.Impl, r, prog, res, resProg)
-	if err != nil {
-		m.logger.Error("plugin after hook error", zap.Error(err))
-		return nil, err
-	}
-
-	return resProg, nil
-}
-
-// doStreamingInference performs streaming inference, collecting all chunks
-// into a complete response AIL program via StreamAssembler.
-func (m *AILModule) doStreamingInference(
-	p *modules.ProviderConfig,
-	cmd drivers.InferenceCommand,
-	chain *plugin.PluginChain,
-	prog *ail.Program,
-	r *http.Request,
-) (*ail.Program, error) {
-	hres, stream, err := cmd.DoInferenceStream(&p.Impl, prog, r)
-	if err != nil {
-		m.logger.Error("inference stream error", zap.String("provider", p.Name), zap.Error(err))
-		_ = chain.RunError(&p.Impl, r, prog, hres, err)
-		return nil, err
-	}
-
-	chunks := make([]*ail.Program, 0)
-	var lastChunk *ail.Program
-
-	for chunk := range stream {
-		if chunk.RuntimeError != nil {
-			_ = chain.RunError(&p.Impl, r, prog, hres, chunk.RuntimeError)
-			return nil, chunk.RuntimeError
-		}
-
-		chunkProg := chunk.Data
-
-		chunkProg, err = chain.RunAfterChunk(&p.Impl, r, prog, hres, chunkProg)
-		if err != nil {
-			m.logger.Error("plugin after chunk error", zap.Error(err))
-			continue
-		}
-
-		if chunkProg != nil {
-			lastChunk = chunkProg
-			chunks = append(chunks, chunkProg)
-		}
-	}
-
-	// Run stream end plugins
-	_ = chain.RunStreamEnd(&p.Impl, r, prog, hres, lastChunk)
-
-	// Assemble all chunk programs into a single response program.
-	result := ail.NewProgram()
-	for _, c := range chunks {
-		if c != nil {
-			result = result.Append(c)
-		}
-	}
-
-	return result, nil
+	// Text (disassembly) format.
+	return ail.Asm(string(data))
 }
 
 var (
 	_ caddy.Provisioner           = (*AILModule)(nil)
 	_ caddyhttp.MiddlewareHandler = (*AILModule)(nil)
+	_ InferenceHandler            = (*AILModule)(nil)
+	_ plugin.ResponseParser       = (*ailResponseParser)(nil)
 )

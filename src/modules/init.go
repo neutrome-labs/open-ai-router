@@ -18,6 +18,7 @@ func init() {
 	plugin.RegisterPlugin("fuzz", &flow.Fuzz{})
 	plugin.RegisterPlugin("stools", &plugins.StripTools{})
 	plugin.RegisterPlugin("slwin", &plugins.SlidingWindow{})
+	plugin.RegisterPlugin("kvtools", plugins.NewKvTools())
 
 	defer func() {
 		_ = services.FireObservabilityEvent("app", "", "init", map[string]any{

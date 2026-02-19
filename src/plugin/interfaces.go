@@ -92,6 +92,33 @@ type HandlerInvoker interface {
 
 	// InvokeHandlerCapture invokes the handler and captures the response as an AIL program.
 	InvokeHandlerCapture(prog *ail.Program, r *http.Request) (*ail.Program, error)
+
+	// InvokeHandlerCaptureStream invokes the handler with streaming enabled,
+	// captures all SSE chunks internally, and returns the assembled AIL program.
+	// Used by ToolPlugin for intermediate tool-dispatch rounds on streaming
+	// requests: the response is buffered so tool calls can be detected and
+	// handled, without streaming partial results to the real client.
+	InvokeHandlerCaptureStream(prog *ail.Program, r *http.Request) (*ail.Program, error)
+
+	// ParseCapturedResponse parses raw bytes from a ResponseCaptureWriter
+	// into an AIL program. Inspects the Content-Type header to determine
+	// the wire format (SSE text/event-stream vs non-streaming JSON/AIL).
+	// Used by ToolPlugin to parse captured responses regardless of the
+	// underlying module format.
+	ParseCapturedResponse(capture *services.ResponseCaptureWriter) (*ail.Program, error)
+}
+
+// ResponseParser converts raw captured response bytes into an AIL program.
+// Injected into CaddyModuleInvoker so the invoker is not coupled to any
+// particular wire format (ChatCompletions JSON, AIL binary, etc.).
+type ResponseParser interface {
+	ParseResponse(data []byte) (*ail.Program, error)
+}
+
+// StreamResponseParser converts captured SSE response bytes into an AIL program.
+// Used by InvokeHandlerCaptureStream to reassemble a streamed response.
+type StreamResponseParser interface {
+	ParseStreamResponse(data []byte) (*ail.Program, error)
 }
 
 // RecursiveHandlerPlugin can intercept the request flow and invoke the handler recursively.

@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
@@ -279,40 +278,17 @@ func (m *ChatCompletionsModule) ServeHTTP(w http.ResponseWriter, r *http.Request
 		return nil
 	}
 
-	// Collect incoming auth
-	r, err := router.Impl.Auth.CollectIncomingAuth(r)
+	chain, r, err := RequestPreamble(router, prog, r, m.logger)
 	if err != nil {
-		m.logger.Error("failed to collect incoming auth", zap.Error(err))
 		http.Error(w, "authentication error", http.StatusUnauthorized)
 		return nil
 	}
-
-	// Resolve virtual model aliases (may chain: virtual→virtual→real).
-	// Each iteration re-resolves the plugin chain for the new model so that
-	// plugins injected by the virtual mapping (target+plugins) are picked up.
-	model := prog.GetModel()
-	var chain *plugin.PluginChain
-	const maxRewriteDepth = 10
-	for i := 0; i < maxRewriteDepth; i++ {
-		chain = plugin.TryResolvePlugins(*r.URL, model)
-		if rewritten := chain.RunModelRewrite(model); rewritten != model {
-			m.logger.Debug("Virtual model resolved",
-				zap.String("from", model),
-				zap.String("to", rewritten))
-			model = rewritten
-			continue
-		}
-		break
-	}
-	prog.SetModel(model)
-
-	m.logger.Debug("Resolved plugins", zap.Int("plugin_count", len(chain.GetPlugins())))
 
 	traceId := uuid.New().String()
 	r = r.WithContext(context.WithValue(r.Context(), plugin.ContextTraceID(), traceId))
 
 	// Create invoker for recursive handler plugins (fallback, parallel, etc.)
-	invoker := plugin.NewCaddyModuleInvoker(m)
+	invoker := plugin.NewCaddyModuleInvoker(m, requestParser)
 
 	// Check if any recursive handler plugin wants to handle this request
 	handled, err := chain.RunRecursiveHandlers(invoker, prog, w, r)
@@ -335,6 +311,30 @@ func (m *ChatCompletionsModule) ServeHTTP(w http.ResponseWriter, r *http.Request
 	return nil
 }
 
+// ServeNonStreaming implements InferenceHandler for ChatCompletions.
+func (m *ChatCompletionsModule) ServeNonStreaming(
+	p *modules.ProviderConfig,
+	cmd drivers.InferenceCommand,
+	chain *plugin.PluginChain,
+	prog *ail.Program,
+	w http.ResponseWriter,
+	r *http.Request,
+) error {
+	return m.serveChatCompletions(p, cmd, chain, prog, w, r)
+}
+
+// ServeStreaming implements InferenceHandler for ChatCompletions.
+func (m *ChatCompletionsModule) ServeStreaming(
+	p *modules.ProviderConfig,
+	cmd drivers.InferenceCommand,
+	chain *plugin.PluginChain,
+	prog *ail.Program,
+	w http.ResponseWriter,
+	r *http.Request,
+) error {
+	return m.serveChatCompletionsStream(p, cmd, chain, prog, w, r)
+}
+
 // handleRequest handles a single request to providers (used both directly and by recursive plugins).
 func (m *ChatCompletionsModule) handleRequest(
 	router *modules.RouterModule,
@@ -343,90 +343,7 @@ func (m *ChatCompletionsModule) handleRequest(
 	w http.ResponseWriter,
 	r *http.Request,
 ) error {
-	providers, model := router.ResolveProvidersOrderAndModel(prog.GetModel())
-
-	m.logger.Debug("Resolved providers",
-		zap.String("model", model),
-		zap.Strings("providers", providers),
-		zap.Int("plugin_count", len(chain.GetPlugins())))
-
-	var displayErr error
-	for _, name := range providers {
-		m.logger.Debug("Trying provider", zap.String("provider", name))
-
-		p, ok := router.ProviderConfigs[name]
-		if !ok {
-			m.logger.Error("provider not found", zap.String("name", name))
-			continue
-		}
-
-		cmd, ok := p.Impl.Commands["inference"].(drivers.InferenceCommand)
-		if !ok {
-			m.logger.Debug("Provider does not support inference", zap.String("provider", name))
-			continue
-		}
-
-		// Clone the program and set the resolved model
-		providerProg := prog.Clone()
-		providerProg.SetModel(model)
-
-		// Run before plugins with provider context
-		processedProg, err := chain.RunBefore(&p.Impl, r, providerProg)
-		if err != nil {
-			m.logger.Error("plugin before hook error", zap.String("provider", name), zap.Error(err))
-			if displayErr == nil {
-				displayErr = err
-			}
-			continue
-		}
-		providerProg = processedProg
-
-		// Sample the upstream-prepared AIL (after model resolve + plugins)
-		if hash, ok := r.Context().Value(ctxKeySampleHash).(string); ok {
-			trySampleAILUpstream(hash, providerProg, m.logger)
-		}
-
-		m.logger.Debug("Executing inference",
-			zap.String("provider", name),
-			zap.String("style", string(p.Impl.Style)),
-			zap.Bool("streaming", providerProg.IsStreaming()))
-
-		// Success - set response headers
-		w.Header().Set("X-Real-Provider-Id", name)
-		w.Header().Set("X-Real-Model-Id", model)
-
-		// Build plugin list for header
-		var pluginNames []string
-		for _, pi := range chain.GetPlugins() {
-			pname := pi.Plugin.Name()
-			if pi.Params != "" {
-				pname += ":" + pi.Params
-			}
-			pluginNames = append(pluginNames, pname)
-		}
-		w.Header().Set("X-Plugins-Executed", strings.Join(pluginNames, ","))
-
-		if providerProg.IsStreaming() {
-			err = m.serveChatCompletionsStream(p, cmd, chain, providerProg, w, r)
-		} else {
-			err = m.serveChatCompletions(p, cmd, chain, providerProg, w, r)
-		}
-
-		if err != nil {
-			if displayErr == nil {
-				displayErr = err
-			}
-			continue
-		}
-
-		return nil
-	}
-
-	if displayErr != nil {
-		return displayErr
-	}
-
-	return nil
+	return RunInferencePipeline(router, chain, prog, w, r, m, m.logger)
 }
 
 // trySampleAIL persists the AIL program to sampleAILDir when SAMPLE_AIL is set.
