@@ -19,16 +19,6 @@ type StripTools struct{}
 
 func (f *StripTools) Name() string { return "stools" }
 
-// ailMsg records the instruction-index span and metadata of a single
-// message (MSG_START..MSG_END) inside the AIL program.
-type ailMsg struct {
-	start    int
-	end      int // inclusive: index of MSG_END
-	role     ail.Opcode
-	hasCalls bool
-	hasText  bool
-}
-
 // toolInteraction records a group: one assistant msg with tool calls,
 // followed by consecutive tool-result messages.
 type toolInteraction struct {
@@ -36,33 +26,26 @@ type toolInteraction struct {
 	endIdx    int // index of last tool-result msg in msgs slice (inclusive)
 }
 
-func (f *StripTools) Before(_ string, _ *services.ProviderService, _ *http.Request, prog *ail.Program) (*ail.Program, error) {
-	// 1. Parse all messages into spans.
-	var msgs []ailMsg
-	cur := ailMsg{start: -1}
-	for i, inst := range prog.Code {
-		switch inst.Op {
-		case ail.MSG_START:
-			cur = ailMsg{start: i}
-		case ail.ROLE_SYS, ail.ROLE_USR, ail.ROLE_AST, ail.ROLE_TOOL:
-			cur.role = inst.Op
-		case ail.CALL_START:
-			cur.hasCalls = true
-		case ail.TXT_CHUNK:
-			cur.hasText = true
-		case ail.MSG_END:
-			cur.end = i
-			msgs = append(msgs, cur)
-			cur = ailMsg{start: -1}
+// spanHasCalls reports whether any instruction in [span.Start, span.End]
+// is a CALL_START opcode.
+func spanHasCalls(prog *ail.Program, span ail.MessageSpan) bool {
+	for i := span.Start; i <= span.End && i < len(prog.Code); i++ {
+		if prog.Code[i].Op == ail.CALL_START {
+			return true
 		}
 	}
+	return false
+}
 
-	// 2. Group into tool interactions.
+func (f *StripTools) Before(_ string, _ *services.ProviderService, _ *http.Request, prog *ail.Program) (*ail.Program, error) {
+	msgs := prog.Messages()
+
+	// Group into tool interactions: assistant msg with calls + following tool results.
 	var interactions []toolInteraction
 	for i := 0; i < len(msgs); i++ {
-		if msgs[i].role == ail.ROLE_AST && msgs[i].hasCalls {
+		if msgs[i].Role == ail.ROLE_AST && spanHasCalls(prog, msgs[i]) {
 			ti := toolInteraction{assistIdx: i, endIdx: i}
-			for j := i + 1; j < len(msgs) && msgs[j].role == ail.ROLE_TOOL; j++ {
+			for j := i + 1; j < len(msgs) && msgs[j].Role == ail.ROLE_TOOL; j++ {
 				ti.endIdx = j
 			}
 			interactions = append(interactions, ti)
@@ -75,8 +58,7 @@ func (f *StripTools) Before(_ string, _ *services.ProviderService, _ *http.Reque
 		return prog, nil
 	}
 
-	// 3. Build a set of instruction-index ranges to drop.
-	//    For stripped assistant msgs with text, we'll re-emit text-only.
+	// Determine what to do with each message in older interactions.
 	type action struct {
 		drop     bool
 		textOnly bool // emit MSG_START + ROLE + text chunks + MSG_END only
@@ -85,7 +67,7 @@ func (f *StripTools) Before(_ string, _ *services.ProviderService, _ *http.Reque
 
 	for _, ti := range interactions[:len(interactions)-1] {
 		// The assistant message: keep as text-only if it has content.
-		if msgs[ti.assistIdx].hasText {
+		if prog.MessageText(msgs[ti.assistIdx]) != "" {
 			msgAction[ti.assistIdx] = action{drop: true, textOnly: true}
 		} else {
 			msgAction[ti.assistIdx] = action{drop: true}
@@ -96,58 +78,57 @@ func (f *StripTools) Before(_ string, _ *services.ProviderService, _ *http.Reque
 		}
 	}
 
-	// 4. Rebuild the program.
+	// Rebuild the program using message spans from ailmanip.
 	out := ail.NewProgram()
 	out.Buffers = prog.Buffers
 
-	msgIdx := 0
+	// Index message spans by their start instruction for the rebuild loop.
+	msgByStart := make(map[int]int, len(msgs)) // instruction index → msgs slice index
+	for idx, m := range msgs {
+		msgByStart[m.Start] = idx
+	}
+
 	i := 0
 	for i < len(prog.Code) {
-		inst := prog.Code[i]
-
-		if inst.Op == ail.MSG_START && msgIdx < len(msgs) {
-			act, hasAction := msgAction[msgIdx]
-			m := msgs[msgIdx]
-			msgIdx++
-
-			if !hasAction {
-				// Keep the entire message as-is.
-				for j := m.start; j <= m.end; j++ {
-					out.Code = append(out.Code, prog.Code[j])
-				}
-				i = m.end + 1
-				continue
-			}
-
-			if act.textOnly {
-				// Re-emit as text-only (strip CALL_START..CALL_END blocks).
-				out.Code = append(out.Code, ail.Instruction{Op: ail.MSG_START})
-				inCall := false
-				for j := m.start + 1; j < m.end; j++ {
-					op := prog.Code[j].Op
-					if op == ail.CALL_START {
-						inCall = true
-						continue
-					}
-					if op == ail.CALL_END {
-						inCall = false
-						continue
-					}
-					if inCall {
-						continue
-					}
-					out.Code = append(out.Code, prog.Code[j])
-				}
-				out.Code = append(out.Code, ail.Instruction{Op: ail.MSG_END})
-			}
-			// else: fully dropped, emit nothing.
-
-			i = m.end + 1
+		msgIdx, isMsgStart := msgByStart[i]
+		if !isMsgStart {
+			out.Code = append(out.Code, prog.Code[i])
+			i++
 			continue
 		}
 
-		out.Code = append(out.Code, inst)
-		i++
+		m := msgs[msgIdx]
+		act, hasAction := msgAction[msgIdx]
+
+		if !hasAction {
+			// Keep the entire message as-is.
+			for j := m.Start; j <= m.End; j++ {
+				out.Code = append(out.Code, prog.Code[j])
+			}
+		} else if act.textOnly {
+			// Re-emit as text-only (strip CALL_START..CALL_END blocks).
+			out.Code = append(out.Code, ail.Instruction{Op: ail.MSG_START})
+			inCall := false
+			for j := m.Start + 1; j < m.End; j++ {
+				op := prog.Code[j].Op
+				if op == ail.CALL_START {
+					inCall = true
+					continue
+				}
+				if op == ail.CALL_END {
+					inCall = false
+					continue
+				}
+				if inCall {
+					continue
+				}
+				out.Code = append(out.Code, prog.Code[j])
+			}
+			out.Code = append(out.Code, ail.Instruction{Op: ail.MSG_END})
+		}
+		// else: fully dropped, emit nothing.
+
+		i = m.End + 1
 	}
 
 	return out, nil

@@ -38,31 +38,13 @@ func (f *SlidingWindow) Before(params string, _ *services.ProviderService, _ *ht
 		}
 	}
 
-	// 1. Find all message spans (MSG_START..MSG_END).
-	type msgSpan struct {
-		start int
-		end   int // inclusive
-	}
-	var msgs []msgSpan
-	for i := 0; i < len(prog.Code); i++ {
-		if prog.Code[i].Op == ail.MSG_START {
-			for j := i; j < len(prog.Code); j++ {
-				if prog.Code[j].Op == ail.MSG_END {
-					msgs = append(msgs, msgSpan{start: i, end: j})
-					i = j
-					break
-				}
-			}
-		}
-	}
-
+	msgs := prog.Messages()
 	total := len(msgs)
 	if total <= keepStart+keepEnd {
-		// Everything fits in the window — nothing to drop.
 		return prog, nil
 	}
 
-	// 2. Determine which messages to keep.
+	// Collect message spans that fall outside both windows.
 	keepSet := make(map[int]bool, keepStart+keepEnd)
 	for i := 0; i < keepStart && i < total; i++ {
 		keepSet[i] = true
@@ -73,26 +55,14 @@ func (f *SlidingWindow) Before(params string, _ *services.ProviderService, _ *ht
 		}
 	}
 
-	// 3. Build a set of instruction indices to drop.
-	drop := make(map[int]bool)
-	for mi, m := range msgs {
-		if !keepSet[mi] {
-			for idx := m.start; idx <= m.end; idx++ {
-				drop[idx] = true
-			}
+	var toRemove []ail.MessageSpan
+	for i, m := range msgs {
+		if !keepSet[i] {
+			toRemove = append(toRemove, m)
 		}
 	}
 
-	// 4. Rebuild the program, copying only non-dropped instructions.
-	out := ail.NewProgram()
-	out.Buffers = prog.Buffers
-	for i, inst := range prog.Code {
-		if !drop[i] {
-			out.Code = append(out.Code, inst)
-		}
-	}
-
-	return out, nil
+	return prog.RemoveMessages(toRemove...), nil
 }
 
 var _ plugin.BeforePlugin = (*SlidingWindow)(nil)

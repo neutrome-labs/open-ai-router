@@ -359,22 +359,15 @@ func (m *AILModule) doStreamingInference(
 	// Run stream end plugins
 	_ = chain.RunStreamEnd(&p.Impl, r, prog, hres, lastChunk)
 
-	disasm := ""
-	for i, c := range chunks {
-		if c == nil {
-			continue
+	// Assemble all chunk programs into a single response program.
+	result := ail.NewProgram()
+	for _, c := range chunks {
+		if c != nil {
+			result = result.Append(c)
 		}
-		disasm += fmt.Sprintf("# Chunk %d\n", i)
-		disasm += c.Disasm() + "\n"
 	}
 
-	asm, err := ail.Asm(disasm)
-	if err != nil {
-		m.logger.Error("failed to assemble streamed AIL", zap.Error(err))
-		return nil, fmt.Errorf("failed to assemble streamed AIL: %w", err)
-	}
-
-	return asm, nil
+	return result, nil
 }
 
 var (

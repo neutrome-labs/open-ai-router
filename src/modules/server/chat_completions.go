@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -220,23 +219,17 @@ func (m *ChatCompletionsModule) serveChatCompletionsStream(
 	// Run stream end plugins
 	_ = chain.RunStreamEnd(&p.Impl, r, prog, hres, lastChunk)
 
-	disasm := ""
-	for i, c := range chunks {
-		if c == nil {
-			continue
+	// Assemble all chunk programs into a single response program.
+	assembled := ail.NewProgram()
+	for _, c := range chunks {
+		if c != nil {
+			assembled = assembled.Append(c)
 		}
-		disasm += fmt.Sprintf("# Chunk %d\n", i)
-		disasm += c.Disasm() + "\n"
-	}
-
-	asm, err := ail.Asm(disasm)
-	if err != nil {
-		m.logger.Error("failed to assemble streamed AIL", zap.Error(err))
 	}
 
 	// Sample the assembled complete response (all chunks, not just last)
 	if hash, ok := r.Context().Value(ctxKeySampleHash).(string); ok {
-		trySampleAILResponse(hash, asm, m.logger)
+		trySampleAILResponse(hash, assembled, m.logger)
 	}
 
 	_ = sseWriter.WriteDone()

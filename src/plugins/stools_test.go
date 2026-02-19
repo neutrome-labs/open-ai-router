@@ -58,50 +58,38 @@ func buildAILProgram(model string, msgs []testMsg) *ail.Program {
 	return p
 }
 
-// countMessages counts MSG_START opcodes in the program.
+// countMessages counts messages in the program using ailmanip.
 func countMessages(p *ail.Program) int {
-	n := 0
-	for _, inst := range p.Code {
-		if inst.Op == ail.MSG_START {
-			n++
-		}
-	}
-	return n
+	return p.CountMessages()
 }
 
 // hasToolCalls returns true if the program contains any CALL_START opcodes.
 func hasToolCalls(p *ail.Program) bool {
-	for _, inst := range p.Code {
-		if inst.Op == ail.CALL_START {
-			return true
-		}
-	}
-	return false
+	return p.HasOpcode(ail.CALL_START)
 }
 
-// collectRoles returns roles of all messages in order.
+// roleString maps an AIL role opcode to a human-readable string.
+func roleString(op ail.Opcode) string {
+	switch op {
+	case ail.ROLE_SYS:
+		return "system"
+	case ail.ROLE_USR:
+		return "user"
+	case ail.ROLE_AST:
+		return "assistant"
+	case ail.ROLE_TOOL:
+		return "tool"
+	default:
+		return "unknown"
+	}
+}
+
+// collectRoles returns roles of all messages in order using ailmanip.
 func collectRoles(p *ail.Program) []string {
-	var roles []string
-	inMsg := false
-	for _, inst := range p.Code {
-		if inst.Op == ail.MSG_START {
-			inMsg = true
-		}
-		if inMsg {
-			switch inst.Op {
-			case ail.ROLE_SYS:
-				roles = append(roles, "system")
-			case ail.ROLE_USR:
-				roles = append(roles, "user")
-			case ail.ROLE_AST:
-				roles = append(roles, "assistant")
-			case ail.ROLE_TOOL:
-				roles = append(roles, "tool")
-			}
-		}
-		if inst.Op == ail.MSG_END {
-			inMsg = false
-		}
+	msgs := p.Messages()
+	roles := make([]string, len(msgs))
+	for i, m := range msgs {
+		roles[i] = roleString(m.Role)
 	}
 	return roles
 }

@@ -152,14 +152,7 @@ func TestSlidingWindow_PreservesNonMessageInstructions(t *testing.T) {
 	}
 
 	// Check DEF_START survived
-	hasDef := false
-	for _, inst := range result.Code {
-		if inst.Op == ail.DEF_START {
-			hasDef = true
-			break
-		}
-	}
-	if !hasDef {
+	if !result.HasOpcode(ail.DEF_START) {
 		t.Error("DEF_START was removed by sliding window")
 	}
 }
