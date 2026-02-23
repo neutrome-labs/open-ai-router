@@ -36,18 +36,19 @@ func ParseStyle(s string) (Style, error) {
 	switch s {
 	case "virtual":
 		return StyleVirtual, nil
-	case "openai-chat-completions", "openai", "":
+	case "chat-completions", "openai", "":
 		return StyleChatCompletions, nil
 	case "openai-responses", "responses":
 		return StyleResponses, nil
-	/*case "anthropic-messages", "anthropic":
+	case "anthropic-messages", "anthropic":
 		return StyleAnthropic, nil
 	case "google-genai", "google":
 		return StyleGoogleGenAI, nil
-	case "cloudflare-ai-gateway":
-		return StyleCfAiGateway, nil
-	case "cloudflare-workers-ai", "cloudflare", "cf":
-		return StyleCfWorkersAi, nil*/
+	// Cloudflare styles not yet implemented in the ail package.
+	// case "cloudflare-ai-gateway":
+	// 	return StyleCfAiGateway, nil
+	// case "cloudflare-workers-ai", "cloudflare", "cf":
+	// 	return StyleCfWorkersAi, nil
 	default:
 		return StyleUnknown, fmt.Errorf("unknown style: %s", s)
 	}

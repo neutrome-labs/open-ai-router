@@ -14,7 +14,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/neutrome-labs/ail"
 	"github.com/neutrome-labs/open-ai-router/src/drivers"
-	"github.com/neutrome-labs/open-ai-router/src/drivers/openai"
 	"github.com/neutrome-labs/open-ai-router/src/drivers/virtual"
 	"github.com/neutrome-labs/open-ai-router/src/modules"
 	"github.com/neutrome-labs/open-ai-router/src/plugin"
@@ -26,7 +25,7 @@ import (
 // through the request context so ServeNonStreaming/ServeStreaming can read it.
 type ailOutputCtxKey struct{}
 
-// AILModule handles raw AIL (AI Intermediate Language) requests over HTTP.
+// InferenceAILModule handles raw AIL (AI Intermediate Language) requests over HTTP.
 //
 // Accepts AIL programs in binary or text (disassembly) format and returns
 // the inference response as an AIL program in the same format.
@@ -48,13 +47,13 @@ type ailOutputCtxKey struct{}
 //
 // If Content-Type is absent or unrecognized, the handler auto-detects:
 // binary if the body starts with the AIL magic bytes ("AIL\x00"), text otherwise.
-type AILModule struct {
+type InferenceAILModule struct {
 	RouterName string `json:"router,omitempty"`
 	logger     *zap.Logger
 }
 
-func ParseAILModule(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
-	var m AILModule
+func ParseInferenceAILModule(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+	var m InferenceAILModule
 	for h.Next() {
 		for h.NextBlock(0) {
 			switch h.Val() {
@@ -71,20 +70,20 @@ func ParseAILModule(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 	return &m, nil
 }
 
-func (*AILModule) CaddyModule() caddy.ModuleInfo {
+func (*InferenceAILModule) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.ail",
-		New: func() caddy.Module { return new(AILModule) },
+		New: func() caddy.Module { return new(InferenceAILModule) },
 	}
 }
 
-func (m *AILModule) Provision(ctx caddy.Context) error {
+func (m *InferenceAILModule) Provision(ctx caddy.Context) error {
 	m.logger = ctx.Logger(m)
 
 	// Provision package-level loggers so that plugins, drivers, and virtual
 	// providers log correctly when only the AIL endpoint is used.
 	plugin.Logger = m.logger.Named("plugin")
-	openai.Logger = m.logger.Named("openai")
+	drivers.Logger = m.logger.Named("drivers")
 	virtual.Logger = m.logger.Named("virtual")
 
 	return nil
@@ -93,7 +92,7 @@ func (m *AILModule) Provision(ctx caddy.Context) error {
 // ailMagic is the 4-byte header of binary AIL files.
 var ailMagic = []byte("AIL\x00")
 
-func (m *AILModule) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+func (m *InferenceAILModule) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	m.logger.Debug("AIL request received", zap.String("method", r.Method))
 
 	var prog *ail.Program
@@ -197,7 +196,7 @@ func (m *AILModule) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 // ─── InferenceHandler implementation ─────────────────────────────────────────
 
 // ServeNonStreaming implements InferenceHandler for AIL.
-func (m *AILModule) ServeNonStreaming(
+func (m *InferenceAILModule) ServeNonStreaming(
 	p *modules.ProviderConfig,
 	cmd drivers.InferenceCommand,
 	chain *plugin.PluginChain,
@@ -225,7 +224,7 @@ func (m *AILModule) ServeNonStreaming(
 
 // ServeStreaming implements InferenceHandler for AIL.
 // Pushes AIL chunk programs to the client incrementally via SSE.
-func (m *AILModule) ServeStreaming(
+func (m *InferenceAILModule) ServeStreaming(
 	p *modules.ProviderConfig,
 	cmd drivers.InferenceCommand,
 	chain *plugin.PluginChain,
@@ -301,7 +300,7 @@ func (m *AILModule) ServeStreaming(
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 // writeAILResponse encodes an AIL program and writes it to the response writer.
-func (m *AILModule) writeAILResponse(w http.ResponseWriter, prog *ail.Program, wantBinary bool) error {
+func (m *InferenceAILModule) writeAILResponse(w http.ResponseWriter, prog *ail.Program, wantBinary bool) error {
 	if wantBinary {
 		w.Header().Set("Content-Type", "application/x-ail")
 		var buf bytes.Buffer
@@ -320,7 +319,7 @@ func (m *AILModule) writeAILResponse(w http.ResponseWriter, prog *ail.Program, w
 // encodeAILChunk encodes a single AIL chunk program for SSE delivery.
 // Text mode: returns the disasm directly.
 // Binary mode: base64-encodes the binary AIL (SSE is text-based).
-func (m *AILModule) encodeAILChunk(prog *ail.Program, wantBinary bool) ([]byte, error) {
+func (m *InferenceAILModule) encodeAILChunk(prog *ail.Program, wantBinary bool) ([]byte, error) {
 	if !wantBinary {
 		return []byte(prog.Disasm()), nil
 	}
@@ -333,7 +332,7 @@ func (m *AILModule) encodeAILChunk(prog *ail.Program, wantBinary bool) ([]byte, 
 }
 
 // isInputBinary determines whether the request body is binary AIL or text.
-func (m *AILModule) isInputBinary(r *http.Request, body []byte) bool {
+func (m *InferenceAILModule) isInputBinary(r *http.Request, body []byte) bool {
 	ct := r.Header.Get("Content-Type")
 	switch {
 	case strings.HasPrefix(ct, "application/x-ail"), strings.HasPrefix(ct, "application/octet-stream"):
@@ -347,7 +346,7 @@ func (m *AILModule) isInputBinary(r *http.Request, body []byte) bool {
 }
 
 // wantBinaryOutput determines the desired output format from the Accept header.
-func (m *AILModule) wantBinaryOutput(r *http.Request, inputBinary bool) bool {
+func (m *InferenceAILModule) wantBinaryOutput(r *http.Request, inputBinary bool) bool {
 	accept := r.Header.Get("Accept")
 	switch {
 	case strings.Contains(accept, "application/x-ail"), strings.Contains(accept, "application/octet-stream"):
@@ -377,8 +376,8 @@ func (p *ailResponseParser) ParseResponse(data []byte) (*ail.Program, error) {
 }
 
 var (
-	_ caddy.Provisioner           = (*AILModule)(nil)
-	_ caddyhttp.MiddlewareHandler = (*AILModule)(nil)
-	_ InferenceHandler            = (*AILModule)(nil)
+	_ caddy.Provisioner           = (*InferenceAILModule)(nil)
+	_ caddyhttp.MiddlewareHandler = (*InferenceAILModule)(nil)
+	_ InferenceHandler            = (*InferenceAILModule)(nil)
 	_ plugin.ResponseParser       = (*ailResponseParser)(nil)
 )

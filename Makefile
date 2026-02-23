@@ -19,51 +19,16 @@ upgrade-all:
 	go get -u ./...
 	go mod tidy
 
-# Run all unit tests
 test:
-	go test -v ./src/... -count=1
+	go test ./src/...
 
-# Run format tests only
-test-formats:
-	go test -v ./src/formats/... -count=1
-
-# Run style tests only
-test-styles:
-	go test -v ./src/styles/... -count=1
-
-# Run plugin tests only
-test-plugins:
-	go test -v ./src/plugins/... -count=1
-
-# Start test server (run in separate terminal)
-test-server: build
-	@echo "Starting test server on :19111..."
-	@bash -c "[ -f .env ] && set -a && source .env && set +a && ./caddy run --config tests/Caddyfile.test"
-
-# Run specific test by name
-test-one:
-	@if [ -z "$(TEST)" ]; then \
-		echo "Usage: make test-one TEST=TestName"; \
-		exit 1; \
-	fi
-	go test -v ./src/... -run "$(TEST)" -count=1
-
-# Run all tests with coverage
-test-coverage:
+coverage:
 	go test -v ./src/... -cover -coverprofile=coverage.out
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report: coverage.html"
 
-# Run tests in short mode (skip slow tests)
-test-short:
-	go test -v ./src/... -short -count=1
-
-# ─── DSPy Sidecar ─────────────────────────────────────────────────────────────
-
-# Install sidecar Python dependencies
 dspy-sidecar-install:
 	pip3 install -r sidecar/requirements.txt
 
-# Start the DSPy sidecar process
 dspy-sidecar:
 	python3 sidecar/dspy_sidecar.py

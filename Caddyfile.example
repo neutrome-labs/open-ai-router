@@ -36,6 +36,20 @@ http://localhost:9111 {
 		}
 	}
 
+	handle_path /inference/v1/ail* {
+		route {
+			header Access-Control-Allow-Origin "*"
+			header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
+			header Access-Control-Allow-Headers "Authorization, Content-Type, Accept, X-Requested-With, X-CSRF-Token, *"
+			@options method OPTIONS
+			respond @options 204
+
+			ai_inference_ail {
+				router default
+			}
+		}
+	}
+
 	handle_path /v1/chat/completions* {
 		route {
 			header Access-Control-Allow-Origin "*"
@@ -44,8 +58,9 @@ http://localhost:9111 {
 			@options method OPTIONS
 			respond @options 204
 
-			ai_chat_completions {
+			ai_inference_sse {
 				router default
+				style  chat-completions
 			}
 		}
 	}

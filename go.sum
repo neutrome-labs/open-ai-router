@@ -249,12 +249,10 @@ github.com/mitchellh/reflectwalk v1.0.2 h1:G2LzWKi524PWgd3mLHV8Y5k7s6XUvT0Gef6zx
 github.com/mitchellh/reflectwalk v1.0.2/go.mod h1:mSTlrgnPZtwu0c4WaC2kGObEpuNDbx0jmZXqmk4esnw=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
-github.com/neutrome-labs/ail v0.0.0-20260219182241-e81e60a5c298 h1:BFdKk26Lnqx0iYk8mYEGL3mqg526zenfmi6vQ46//gE=
-github.com/neutrome-labs/ail v0.0.0-20260219182241-e81e60a5c298/go.mod h1:ab6JE5+ui7Ush08y1UN24u5jz7pDvm1ASMoEDpytp1U=
-github.com/neutrome-labs/ail v0.0.0-20260219213158-abacbc494779 h1:ykxN7ZgN8d4nbArJGBUI3NsT60qODLXeLw1SxniKe94=
-github.com/neutrome-labs/ail v0.0.0-20260219213158-abacbc494779/go.mod h1:ab6JE5+ui7Ush08y1UN24u5jz7pDvm1ASMoEDpytp1U=
 github.com/neutrome-labs/ail v0.0.0-20260219221943-7813051ddfc4 h1:FCFRcGMkotzEPs3XnaaWixTkxAMVX4O9f5SM34Shdxw=
 github.com/neutrome-labs/ail v0.0.0-20260219221943-7813051ddfc4/go.mod h1:ab6JE5+ui7Ush08y1UN24u5jz7pDvm1ASMoEDpytp1U=
+github.com/neutrome-labs/ail v0.0.0-20260223214008-4457271de801 h1:4E+edUfyUwYlCPXYgzWD8Ykt6TC6vR6gk9ZII8osaGw=
+github.com/neutrome-labs/ail v0.0.0-20260223214008-4457271de801/go.mod h1:ab6JE5+ui7Ush08y1UN24u5jz7pDvm1ASMoEDpytp1U=
 github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 h1:onHthvaw9LFnH4t2DcNVpwGmV9E1BkGknEliJkfwQj0=
 github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58/go.mod h1:DXv8WO4yhMYhSNPKjeNKa5WY9YCIEBRbNzFFPJbWO6Y=
 github.com/pelletier/go-toml v1.2.0/go.mod h1:5z9KED0ma1S8pY6P1sdut58dfprrGBbd/94hg7ilaic=
@@ -265,6 +263,8 @@ github.com/pires/go-proxyproto v0.11.0/go.mod h1:ZKAAyp3cgy5Y5Mo4n9AlScrkCZwUy0g
 github.com/pkg/errors v0.8.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
 github.com/pkg/errors v0.9.1 h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=
 github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
+github.com/pkoukk/tiktoken-go v0.1.8 h1:85ENo+3FpWgAACBaEUVp+lctuTcYUO7BtmfhlN/QTRo=
+github.com/pkoukk/tiktoken-go v0.1.8/go.mod h1:9NiV+i9mJKGj1rYOT+njbv+ZwA/zJxYdewGl6qVatpg=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 h1:Jamvg5psRIccs7FGNTlIRMkT8wgtp5eCXdBlqhYGL6U=
 github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=

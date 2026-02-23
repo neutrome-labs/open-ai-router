@@ -101,10 +101,25 @@ func (d *DSPy) RecursiveHandler(
 	sidecarURL := getSidecarURL()
 	timeout := getTimeout()
 
+	// Resolve emitters for the client-facing format.
+	clientStyle := plugin.ClientStyleFromContext(r.Context())
+
 	if prog.IsStreaming() {
-		err = d.handleStreaming(sidecarURL, timeout, payload, authHeader, w)
+		chunkEmitter, emErr := ail.GetStreamChunkEmitter(clientStyle)
+		if emErr != nil {
+			plugin.Logger.Error("dspy: no stream chunk emitter", zap.Error(emErr))
+			http.Error(w, "dspy: "+emErr.Error(), http.StatusInternalServerError)
+			return true, nil
+		}
+		err = d.handleStreaming(sidecarURL, timeout, payload, authHeader, w, chunkEmitter)
 	} else {
-		err = d.handleNonStreaming(sidecarURL, timeout, payload, authHeader, w)
+		respEmitter, emErr := ail.GetResponseEmitter(clientStyle)
+		if emErr != nil {
+			plugin.Logger.Error("dspy: no response emitter", zap.Error(emErr))
+			http.Error(w, "dspy: "+emErr.Error(), http.StatusInternalServerError)
+			return true, nil
+		}
+		err = d.handleNonStreaming(sidecarURL, timeout, payload, authHeader, w, respEmitter)
 	}
 	if err != nil {
 		plugin.Logger.Error("dspy: sidecar call failed", zap.Error(err))
@@ -124,6 +139,7 @@ func (d *DSPy) handleNonStreaming(
 	payload *sidecarRequest,
 	authHeader string,
 	w http.ResponseWriter,
+	respEmitter ail.ResponseEmitter,
 ) error {
 	payload.Stream = false
 
@@ -163,9 +179,7 @@ func (d *DSPy) handleNonStreaming(
 	// Build an AIL response program from the sidecar prediction.
 	resProg := buildResponseProgram(payload.Model, payload.Signature, &sResp)
 
-	// Emit as ChatCompletions JSON.
-	emitter := &ail.ChatCompletionsEmitter{}
-	resData, err := emitter.EmitResponse(resProg)
+	resData, err := respEmitter.EmitResponse(resProg)
 	if err != nil {
 		return fmt.Errorf("emit response: %w", err)
 	}
@@ -184,6 +198,7 @@ func (d *DSPy) handleStreaming(
 	payload *sidecarRequest,
 	authHeader string,
 	w http.ResponseWriter,
+	chunkEmitter ail.StreamChunkEmitter,
 ) error {
 	payload.Stream = true
 
@@ -226,7 +241,6 @@ func (d *DSPy) handleStreaming(
 	reader := sse.NewDefaultReader(resp.Body)
 	events := reader.ReadEvents()
 
-	emitter := &ail.ChatCompletionsEmitter{}
 	chunkIndex := 0
 	var streamErr error
 
@@ -252,7 +266,7 @@ func (d *DSPy) handleStreaming(
 		switch sEvent.Type {
 		case "chunk":
 			chunkProg := buildStreamChunk(payload.Model, sEvent.Field, sEvent.Text, chunkIndex == 0)
-			chunkData, err := emitter.EmitStreamChunk(chunkProg)
+			chunkData, err := chunkEmitter.EmitStreamChunk(chunkProg)
 			if err != nil {
 				plugin.Logger.Debug("dspy: emit stream chunk error", zap.Error(err))
 				continue
@@ -275,7 +289,7 @@ func (d *DSPy) handleStreaming(
 		case "tool_call":
 			// Tool call from ReAct — emit as a tool_calls delta.
 			chunkProg := buildStreamToolCall(payload.Model, &sEvent)
-			chunkData, err := emitter.EmitStreamChunk(chunkProg)
+			chunkData, err := chunkEmitter.EmitStreamChunk(chunkProg)
 			if err != nil {
 				continue
 			}
@@ -294,7 +308,7 @@ func (d *DSPy) handleStreaming(
 				// Emit reasoning as a thinking delta if present.
 				if reasoning, ok := sEvent.Outputs["reasoning"]; ok && reasoning != "" {
 					chunkProg := buildStreamChunk(payload.Model, "reasoning", reasoning, chunkIndex == 0)
-					if chunkData, err := emitter.EmitStreamChunk(chunkProg); err == nil {
+					if chunkData, err := chunkEmitter.EmitStreamChunk(chunkProg); err == nil {
 						_ = sseWriter.WriteRaw(chunkData)
 						chunkIndex++
 					}
@@ -310,7 +324,7 @@ func (d *DSPy) handleStreaming(
 						continue
 					}
 					chunkProg := buildStreamChunk(payload.Model, field, text, chunkIndex == 0)
-					if chunkData, err := emitter.EmitStreamChunk(chunkProg); err == nil {
+					if chunkData, err := chunkEmitter.EmitStreamChunk(chunkProg); err == nil {
 						_ = sseWriter.WriteRaw(chunkData)
 						chunkIndex++
 					}
@@ -455,16 +469,7 @@ func buildSidecarPayload(kind, signature string, prog *ail.Program) (*sidecarReq
 	var tools []sidecarToolDef
 	if kind == "react" {
 		for _, td := range prog.ToolDefs() {
-			def := sidecarToolDef{Name: td.Name}
-			for i := td.Start; i <= td.End && i < len(prog.Code); i++ {
-				switch prog.Code[i].Op {
-				case ail.DEF_DESC:
-					def.Description = prog.Code[i].Str
-				case ail.DEF_SCHEMA:
-					def.Schema = prog.Code[i].JSON
-				}
-			}
-			tools = append(tools, def)
+			tools = append(tools, extractToolDef(prog, td))
 		}
 	}
 
@@ -513,6 +518,22 @@ func buildHistory(prog *ail.Program) []historyMessage {
 }
 
 // ─── Signature parsing ───────────────────────────────────────────────────────
+
+// extractToolDef converts a ToolDefSpan into a sidecarToolDef.
+// ailmanip exposes Name via the span; DEF_DESC and DEF_SCHEMA require a
+// focused range scan since ToolDefSpan does not surface them directly.
+func extractToolDef(prog *ail.Program, td ail.ToolDefSpan) sidecarToolDef {
+	def := sidecarToolDef{Name: td.Name}
+	for i := td.Start; i <= td.End && i < len(prog.Code); i++ {
+		switch prog.Code[i].Op {
+		case ail.DEF_DESC:
+			def.Description = prog.Code[i].Str
+		case ail.DEF_SCHEMA:
+			def.Schema = prog.Code[i].JSON
+		}
+	}
+	return def
+}
 
 // parseSignatureFields splits "a, b -> c, d" into input fields and output fields.
 func parseSignatureFields(sig string) (inputs []string, outputs []string) {

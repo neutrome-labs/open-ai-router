@@ -18,8 +18,8 @@ var APP_VERSION = "5.0.0"
 func init() {
 	services.TryInstrumentAppObservability()
 
+	plugin.RegisterPlugin("tiktoken", plugins.NewTiktoken())
 	plugin.RegisterPlugin("fuzz", &flow.Fuzz{})
-	plugin.RegisterPlugin("stools", &plugins.StripTools{})
 	plugin.RegisterPlugin("slwin", &plugins.SlidingWindow{})
 	plugin.RegisterPlugin("kvtools", plugins.NewKvTools())
 	plugin.RegisterPlugin("dspy", &dspy.DSPy{})

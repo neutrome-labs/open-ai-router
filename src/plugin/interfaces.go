@@ -3,6 +3,7 @@
 package plugin
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/neutrome-labs/ail"
@@ -155,4 +156,23 @@ var ProviderLister func() []*services.ProviderService
 type PluginInstance struct {
 	Plugin Plugin
 	Params string
+}
+
+// ─── Client style context ───────────────────────────────────────────────────
+
+// clientStyleCtxKey is the context key for the client-facing API style.
+type clientStyleCtxKey struct{}
+
+// ContextClientStyleKey returns the context key for the client-facing API style.
+// Endpoint modules store their ail.Style in request context under this key so
+// recursive plugins (DSPy, tools, etc.) can emit responses in the correct format.
+func ContextClientStyleKey() any { return clientStyleCtxKey{} }
+
+// ClientStyleFromContext extracts the client API style from request context.
+// Returns StyleChatCompletions as the default if not set.
+func ClientStyleFromContext(ctx context.Context) ail.Style {
+	if v, ok := ctx.Value(clientStyleCtxKey{}).(ail.Style); ok {
+		return v
+	}
+	return ail.StyleChatCompletions
 }

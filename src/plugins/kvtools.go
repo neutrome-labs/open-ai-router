@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -110,11 +111,15 @@ func (k *KvTools) Before(params string, p *services.ProviderService, r *http.Req
 	return k.ToolPlugin.Before(params, p, r, prog)
 }
 
-// cacheAndStrip caches tool results from completed interactions, strips
-// them from the conversation, and prepends a note about cached call IDs.
+// cacheAndStrip caches tool results from completed interactions and strips
+// the RESULT_DATA content from older results, keeping the result message
+// structure (RESULT_START/RESULT_END) and tool calls intact so call IDs
+// remain visible in context alongside their calls.
 func (k *KvTools) cacheAndStrip(params string, r *http.Request, prog *ail.Program) (*ail.Program, error) {
 	store := k.ensureStore(params)
 	msgs := prog.Messages()
+	allCalls := prog.ToolCalls()
+	allResults := prog.ToolResults()
 
 	// Identify tool interactions: assistant msg with calls + following tool results.
 	type interaction struct {
@@ -123,7 +128,7 @@ func (k *KvTools) cacheAndStrip(params string, r *http.Request, prog *ail.Progra
 	}
 	var interactions []interaction
 	for i := 0; i < len(msgs); i++ {
-		if msgs[i].Role == ail.ROLE_AST && spanHasCalls(prog, msgs[i]) {
+		if msgs[i].Role == ail.ROLE_AST && spanHasCalls(allCalls, msgs[i]) {
 			ti := interaction{assistIdx: i, endIdx: i}
 			for j := i + 1; j < len(msgs) && msgs[j].Role == ail.ROLE_TOOL; j++ {
 				ti.endIdx = j
@@ -145,57 +150,39 @@ func (k *KvTools) cacheAndStrip(params string, r *http.Request, prog *ail.Progra
 
 	toCache := interactions[:len(interactions)-1]
 
-	// Cache all tool results from older interactions.
+	// Cache tool result data from older interactions and collect
+	// the RESULT_DATA instruction indices to remove.
+	var dataIndices []int
 	for _, ti := range toCache {
 		for j := ti.assistIdx + 1; j <= ti.endIdx; j++ {
 			if msgs[j].Role != ail.ROLE_TOOL {
 				continue
 			}
-			results := prog.ToolResults()
-			for _, res := range results {
+			for _, res := range allResults {
 				if res.Start >= msgs[j].Start && res.End <= msgs[j].End {
-					for idx := res.Start; idx <= res.End && idx < len(prog.Code); idx++ {
-						if prog.Code[idx].Op == ail.RESULT_DATA {
-							_ = store.Set(
-								context.Background(),
-								kvKey(traceID, res.CallID),
-								prog.Code[idx].Str,
-								30*time.Minute,
-							)
-							break
-						}
+					if idx, data := resultDataIndex(prog, res); data != "" {
+						_ = store.Set(
+							context.Background(),
+							kvKey(traceID, res.CallID),
+							data,
+							30*time.Minute,
+						)
+						dataIndices = append(dataIndices, idx)
 					}
 				}
 			}
 		}
 	}
 
-	// Collect cached call IDs for the note.
-	var cachedIDs []string
-	for _, ti := range toCache {
-		calls := prog.ToolCalls()
-		for _, c := range calls {
-			if c.Start >= msgs[ti.assistIdx].Start && c.End <= msgs[ti.assistIdx].End {
-				cachedIDs = append(cachedIDs, c.CallID)
-			}
-		}
+	if len(dataIndices) == 0 {
+		return prog, nil
 	}
 
-	// Strip older interactions.
-	var toRemove []ail.MessageSpan
-	for _, ti := range toCache {
-		for j := ti.assistIdx; j <= ti.endIdx; j++ {
-			toRemove = append(toRemove, msgs[j])
-		}
-	}
-	result := prog.RemoveMessages(toRemove...)
-
-	// Prepend context about available recalls.
-	if len(cachedIDs) > 0 {
-		note := "Previous tool call results have been cached and removed from context to save tokens. " +
-			"You can retrieve any of them using get_tool_result with these call IDs: " +
-			strings.Join(cachedIDs, ", ")
-		result = result.PrependSystemPrompt(note)
+	// Remove RESULT_DATA instructions in reverse order so indices stay valid.
+	sort.Sort(sort.Reverse(sort.IntSlice(dataIndices)))
+	result := prog
+	for _, idx := range dataIndices {
+		result = result.RemoveRange(idx, idx)
 	}
 
 	return result, nil
@@ -229,6 +216,27 @@ func kvKey(traceID, callID string) string {
 		return "kvtools:" + traceID + ":" + callID
 	}
 	return "kvtools::" + callID
+}
+
+// spanHasCalls reports whether the given message span contains any tool calls.
+func spanHasCalls(calls []ail.ToolCallSpan, span ail.MessageSpan) bool {
+	for _, c := range calls {
+		if c.Start >= span.Start && c.End <= span.End {
+			return true
+		}
+	}
+	return false
+}
+
+// resultDataIndex returns the index and content of the RESULT_DATA instruction
+// within a tool result span. Returns (-1, "") if not found.
+func resultDataIndex(prog *ail.Program, res ail.ToolResultSpan) (int, string) {
+	for i := res.Start; i <= res.End && i < len(prog.Code); i++ {
+		if prog.Code[i].Op == ail.RESULT_DATA {
+			return i, prog.Code[i].Str
+		}
+	}
+	return -1, ""
 }
 
 // Compile-time checks: KvTools satisfies BeforePlugin (overriding the embedded one)

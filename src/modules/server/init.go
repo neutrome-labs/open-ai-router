@@ -11,11 +11,11 @@ func init() {
 	httpcaddyfile.RegisterHandlerDirective("ai_list_models", ParseListModelsModule)
 	httpcaddyfile.RegisterDirectiveOrder("ai_list_models", httpcaddyfile.Before, "header")
 
-	caddy.RegisterModule(&ChatCompletionsModule{})
-	httpcaddyfile.RegisterHandlerDirective("ai_chat_completions", ParseChatCompletionsModule)
-	httpcaddyfile.RegisterDirectiveOrder("ai_chat_completions", httpcaddyfile.Before, "header")
+	caddy.RegisterModule(&InferenceAILModule{})
+	httpcaddyfile.RegisterHandlerDirective("ai_inference_ail", ParseInferenceAILModule)
+	httpcaddyfile.RegisterDirectiveOrder("ai_inference_ail", httpcaddyfile.Before, "header")
 
-	caddy.RegisterModule(&AILModule{})
-	httpcaddyfile.RegisterHandlerDirective("ail", ParseAILModule)
-	httpcaddyfile.RegisterDirectiveOrder("ail", httpcaddyfile.Before, "header")
+	caddy.RegisterModule(&InferenceSseModule{})
+	httpcaddyfile.RegisterHandlerDirective("ai_inference_sse", ParseInferenceSseModule)
+	httpcaddyfile.RegisterDirectiveOrder("ai_inference_sse", httpcaddyfile.Before, "header")
 }

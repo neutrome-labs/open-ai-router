@@ -6,8 +6,8 @@ import (
 
 func TestParseParams_Defaults(t *testing.T) {
 	kind, sig := parseParams("")
-	if kind != "react" {
-		t.Errorf("expected kind=react, got %q", kind)
+	if kind != "cot" {
+		t.Errorf("expected kind=cot, got %q", kind)
 	}
 	if sig != "history, question -> answer" {
 		t.Errorf("expected default signature, got %q", sig)
@@ -37,8 +37,8 @@ func TestParseParams_KindAndSignature(t *testing.T) {
 
 func TestParseParams_EmptyKindExplicitSig(t *testing.T) {
 	kind, sig := parseParams(":question%20->%20answer")
-	if kind != "react" {
-		t.Errorf("expected default kind=react, got %q", kind)
+	if kind != "cot" {
+		t.Errorf("expected default kind=cot, got %q", kind)
 	}
 	if sig != "question -> answer" {
 		t.Errorf("expected sig=%q, got %q", "question -> answer", sig)

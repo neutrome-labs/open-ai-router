@@ -9,7 +9,9 @@ import (
 var HeadPlugins = [][2]string{}
 
 // TailPlugins are plugins that are always executed after others.
-var TailPlugins = [][2]string{}
+var TailPlugins = [][2]string{
+	{"tiktoken", ""},
+}
 
 func TryResolvePlugins(url url.URL, model string) *PluginChain {
 	chain := NewPluginChain()

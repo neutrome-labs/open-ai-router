@@ -122,6 +122,9 @@ func RunInferencePipeline(
 		var pluginNames []string
 		for _, pi := range chain.GetPlugins() {
 			pname := pi.Plugin.Name()
+			if strings.HasPrefix(pname, "virtual") {
+				continue
+			}
 			if pi.Params != "" {
 				pname += ":" + pi.Params
 			}
@@ -129,6 +132,19 @@ func RunInferencePipeline(
 		}
 		if len(pluginNames) > 0 {
 			w.Header().Set("X-Plugins-Executed", strings.Join(pluginNames, ","))
+		}
+
+		// Promote SET_META keys starting with "x-" to response headers and
+		// strip them from the program so they do not leak to the provider.
+		var metaToRemove []int
+		for i, inst := range providerProg.Code {
+			if inst.Op == ail.SET_META && strings.HasPrefix(inst.Key, "x-") {
+				w.Header().Set(inst.Key, inst.Str)
+				metaToRemove = append(metaToRemove, i)
+			}
+		}
+		if len(metaToRemove) > 0 {
+			providerProg = providerProg.ClearAtIndex(metaToRemove...)
 		}
 
 		// Dispatch to module-specific handler.

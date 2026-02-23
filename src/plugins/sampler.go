@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/neutrome-labs/ail"
 	"github.com/neutrome-labs/open-ai-router/src/plugin"
@@ -60,7 +62,7 @@ func (s *Sampler) OnRequestInit(r *http.Request, prog *ail.Program) {
 		return
 	}
 	sum := sha256.Sum256(buf.Bytes())
-	hash := hex.EncodeToString(sum[:])
+	hash := fmt.Sprintf("%s_%s", time.Now().UTC().Format("20060102-150405"), hex.EncodeToString(sum[:]))
 
 	s.hashes.Store(traceID, hash)
 

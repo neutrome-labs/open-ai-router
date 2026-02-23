@@ -5,7 +5,8 @@ go 1.25.5
 require (
 	github.com/caddyserver/caddy/v2 v2.10.2
 	github.com/google/uuid v1.6.0
-	github.com/neutrome-labs/ail v0.0.0-20260219221943-7813051ddfc4
+	github.com/neutrome-labs/ail v0.0.0-20260223214008-4457271de801
+	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/posthog/posthog-go v1.10.0
 	go.uber.org/zap v1.27.1
 )

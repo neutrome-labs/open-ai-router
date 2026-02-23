@@ -21,13 +21,13 @@ func TestPluginRegistry(t *testing.T) {
 		t.Errorf("Plugin name mismatch: got %q, want %q", p.Name(), "fuzz")
 	}
 
-	// stools plugin
-	p, ok = plugin.GetPlugin("stools")
+	// kvtools plugin
+	p, ok = plugin.GetPlugin("kvtools")
 	if !ok {
-		t.Fatal("Plugin \"stools\" not found in registry")
+		t.Fatal("Plugin \"kvtools\" not found in registry")
 	}
-	if p.Name() != "stools" {
-		t.Errorf("Plugin name mismatch: got %q, want %q", p.Name(), "stools")
+	if p.Name() != "kvtools" {
+		t.Errorf("Plugin name mismatch: got %q, want %q", p.Name(), "kvtools")
 	}
 
 	// slwin plugin

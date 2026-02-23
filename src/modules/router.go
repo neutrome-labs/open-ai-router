@@ -235,21 +235,10 @@ func (m *RouterModule) Provision(ctx caddy.Context) error {
 		// Initialize commands based on style
 		var providerCommands map[string]any
 		switch providerStyle {
-		case styles.StyleChatCompletions: // OpenAI-compatible (chat completions)
-			providerCommands = map[string]any{
-				"list_models": &openai.ListModels{},
-				"inference":   &openai.ChatCompletions{},
-			}
-		case styles.StyleResponses: // OpenAI Responses API
-			providerCommands = map[string]any{
-				"list_models": &openai.ListModels{},
-				"inference":   &openai.Responses{},
-			}
 		case styles.StyleVirtual: // Virtual provider (model aliasing)
 			if len(p.ModelMappings) == 0 {
 				return fmt.Errorf("provider %s: virtual provider requires at least one model mapping", name)
 			}
-			// Register the virtual plugin so it can intercept requests
 			virtualPlugin := &virtual.VirtualPlugin{
 				ProviderName:  name,
 				ModelMappings: p.ModelMappings,
@@ -261,10 +250,19 @@ func (m *RouterModule) Provision(ctx caddy.Context) error {
 					ProviderName:  name,
 					ModelMappings: p.ModelMappings,
 				},
-				// No inference command - virtual providers work via plugin interception
 			}
 		default:
-			return fmt.Errorf("provider %s: no driver for style '%s'", name, providerStyle)
+			// Generic: create an InferenceSse driver for any ail-supported upstream style.
+			// Adding a new provider style requires only that the ail package
+			// registers parsers/emitters for it — no router code changes.
+			driver, err := drivers.NewInferenceSse(providerStyle, drivers.EndpointForStyle(providerStyle))
+			if err != nil {
+				return fmt.Errorf("provider %s: unsupported style %q: %v", name, p.Style, err)
+			}
+			providerCommands = map[string]any{
+				"list_models": &openai.ListModels{},
+				"inference":   driver,
+			}
 		}
 		p.Impl.Commands = providerCommands
 
