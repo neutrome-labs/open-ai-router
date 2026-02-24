@@ -35,6 +35,15 @@ type ToolCallContext struct {
 
 	// RequestProg is the original (pre-tool-injection) request AIL program.
 	RequestProg *ail.Program
+
+	// Invoker allows tool handlers to perform sub-inference calls.
+	// Available only when triggered via RecursiveHandler (i.e. always
+	// during normal ToolPlugin orchestration).
+	Invoker HandlerInvoker
+
+	// Request is the original HTTP request. Useful for extracting
+	// context values (auth, headers, etc.) in sub-inference calls.
+	Request *http.Request
 }
 
 // ─── ToolPlugin: composable base ─────────────────────────────────────────────
@@ -124,6 +133,8 @@ func (tp *ToolPlugin) RecursiveHandler(
 	ctx := &ToolCallContext{
 		TraceID:     traceID,
 		RequestProg: prog,
+		Invoker:     invoker,
+		Request:     r,
 	}
 
 	// Set recursion guard so inner InvokeHandler calls don't re-enter.

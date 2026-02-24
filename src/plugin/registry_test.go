@@ -115,7 +115,7 @@ func TestMandatoryPlugins(t *testing.T) {
 	if len(plugin.HeadPlugins) != 0 {
 		t.Errorf("Expected empty HeadPlugins, got %d", len(plugin.HeadPlugins))
 	}
-	if len(plugin.TailPlugins) != 0 {
-		t.Errorf("Expected empty TailPlugins, got %d", len(plugin.TailPlugins))
+	if len(plugin.TailPlugins) != 1 {
+		t.Errorf("Expected 1 TailPlugin, got %d", len(plugin.TailPlugins))
 	}
 }
