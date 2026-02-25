@@ -55,6 +55,13 @@ func (s *Sampler) OnRequestInit(r *http.Request, prog *ail.Program) {
 		return
 	}
 
+	// On InferFresh re-entry, OnRequestInit fires again with the sub-step's
+	// program. Skip if we already have a hash for this trace — all steps
+	// should land in the same sample directory.
+	if _, exists := s.hashes.Load(traceID); exists {
+		return
+	}
+
 	// Derive a stable hash from the binary encoding of the initial request.
 	var buf bytes.Buffer
 	if err := prog.Encode(&buf); err != nil {
@@ -96,6 +103,9 @@ func (s *Sampler) OnRequestInit(r *http.Request, prog *ail.Program) {
 // Before is called after all other before-plugins have run (sampler lives in
 // TailPlugins). The prog received is the upstream-prepared program — i.e.
 // the state that will actually be sent to the provider.
+//
+// When a SamplerStep is set in context (by recursive handler plugins like chain),
+// the file is namespaced by step index: request.up.0.ail, request.up.1.ail, etc.
 func (s *Sampler) Before(_ string, _ *services.ProviderService, r *http.Request, prog *ail.Program) (*ail.Program, error) {
 	traceID, _ := r.Context().Value(plugin.ContextTraceID()).(string)
 	hashVal, ok := s.hashes.Load(traceID)
@@ -112,7 +122,14 @@ func (s *Sampler) Before(_ string, _ *services.ProviderService, r *http.Request,
 		return prog, nil
 	}
 
-	binPath := filepath.Join(detailsDir, "request.up.ail")
+	// Determine filename suffix based on step context.
+	step, hasStep := plugin.SamplerStepFromContext(r.Context())
+	suffix := ""
+	if hasStep {
+		suffix = fmt.Sprintf(".%d", step.Index)
+	}
+
+	binPath := filepath.Join(detailsDir, fmt.Sprintf("request.up%s.ail", suffix))
 	if err := os.WriteFile(binPath, buf.Bytes(), 0o644); err != nil {
 		Logger.Error("SAMPLER: write upstream binary failed", zap.String("path", binPath), zap.Error(err))
 		return prog, nil
@@ -124,10 +141,16 @@ func (s *Sampler) Before(_ string, _ *services.ProviderService, r *http.Request,
 		Logger.Error("SAMPLER: open disasm file failed", zap.String("path", txtPath), zap.Error(err))
 		return prog, nil
 	}
-	_, _ = f.WriteString("\n\n--- --- ---\n\n; upstream request\n" + prog.Disasm())
+	label := "upstream request"
+	if hasStep && step.Label != "" {
+		label = fmt.Sprintf("upstream request [step %d: %s]", step.Index, step.Label)
+	} else if hasStep {
+		label = fmt.Sprintf("upstream request [step %d]", step.Index)
+	}
+	_, _ = f.WriteString("\n\n--- --- ---\n\n; " + label + "\n" + prog.Disasm())
 	_ = f.Close()
 
-	Logger.Debug("SAMPLER: saved upstream request", zap.String("hash", hash))
+	Logger.Debug("SAMPLER: saved upstream request", zap.String("hash", hash), zap.String("suffix", suffix))
 	return prog, nil
 }
 
@@ -146,6 +169,9 @@ func (s *Sampler) StreamEnd(_ string, _ *services.ProviderService, r *http.Reque
 }
 
 // writeResponse persists the response AIL and appends its disassembly.
+// When a SamplerStep is set in context, files are namespaced by step index
+// and the hash is NOT deleted (more steps may follow). The hash is cleaned
+// up when a response is written without step context (final response).
 func (s *Sampler) writeResponse(r *http.Request, prog *ail.Program) {
 	if prog == nil {
 		return
@@ -156,7 +182,14 @@ func (s *Sampler) writeResponse(r *http.Request, prog *ail.Program) {
 		return
 	}
 	hash := hashVal.(string)
-	defer s.hashes.Delete(traceID)
+
+	step, hasStep := plugin.SamplerStepFromContext(r.Context())
+
+	// Only delete the hash when this is NOT a sub-step write.
+	// Sub-step writes leave the hash alive for subsequent steps.
+	if !hasStep {
+		defer s.hashes.Delete(traceID)
+	}
 
 	detailsDir := filepath.Join(s.Dir, hash)
 
@@ -166,7 +199,12 @@ func (s *Sampler) writeResponse(r *http.Request, prog *ail.Program) {
 		return
 	}
 
-	binPath := filepath.Join(detailsDir, "response.ail")
+	suffix := ""
+	if hasStep {
+		suffix = fmt.Sprintf(".%d", step.Index)
+	}
+
+	binPath := filepath.Join(detailsDir, fmt.Sprintf("response%s.ail", suffix))
 	if err := os.WriteFile(binPath, buf.Bytes(), 0o644); err != nil {
 		Logger.Error("SAMPLER: write response binary failed", zap.String("path", binPath), zap.Error(err))
 		return
@@ -178,10 +216,16 @@ func (s *Sampler) writeResponse(r *http.Request, prog *ail.Program) {
 		Logger.Error("SAMPLER: open disasm file failed for response", zap.String("path", txtPath), zap.Error(err))
 		return
 	}
-	_, _ = f.WriteString("\n\n--- --- ---\n\n; response\n" + prog.Disasm())
+	label := "response"
+	if hasStep && step.Label != "" {
+		label = fmt.Sprintf("response [step %d: %s]", step.Index, step.Label)
+	} else if hasStep {
+		label = fmt.Sprintf("response [step %d]", step.Index)
+	}
+	_, _ = f.WriteString("\n\n--- --- ---\n\n; " + label + "\n" + prog.Disasm())
 	_ = f.Close()
 
-	Logger.Debug("SAMPLER: saved response", zap.String("hash", hash))
+	Logger.Debug("SAMPLER: saved response", zap.String("hash", hash), zap.String("suffix", suffix))
 }
 
 // Ensure Sampler implements the required plugin interfaces.

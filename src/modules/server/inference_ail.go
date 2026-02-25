@@ -167,8 +167,12 @@ func (m *InferenceAILModule) ServeHTTP(w http.ResponseWriter, r *http.Request, n
 		return nil
 	}
 
-	traceId := uuid.New().String()
-	r = r.WithContext(context.WithValue(r.Context(), plugin.ContextTraceID(), traceId))
+	// Preserve trace ID across InferFresh re-entries; generate only if absent.
+	traceID, _ := r.Context().Value(plugin.ContextTraceID()).(string)
+	if traceID == "" {
+		traceID = uuid.New().String()
+	}
+	r = r.WithContext(context.WithValue(r.Context(), plugin.ContextTraceID(), traceID))
 
 	// Notify plugins of the initial parsed request (e.g., sampler).
 	chain.RunRequestInit(r, prog)
@@ -180,13 +184,13 @@ func (m *InferenceAILModule) ServeHTTP(w http.ResponseWriter, r *http.Request, n
 			return RunInferencePipeline(router, chain, p, w, req, m, m.logger)
 		},
 		InferFresh: func(p *ail.Program, w http.ResponseWriter, req *http.Request) error {
-			freshR := req.WithContext(plugin.WithRecursionBypass(req.Context()))
-			freshR = freshR.WithContext(ail.ContextWithProgram(freshR.Context(), p))
+			freshR := req.WithContext(ail.ContextWithProgram(req.Context(), p))
 			return m.ServeHTTP(w, freshR, nil)
 		},
 		ParseCapture: func(cap *services.ResponseCaptureWriter) (*ail.Program, error) {
 			return plugin.ParseCapturedResponse(cap, ailParser, ailParser)
 		},
+		Chain: chain,
 	}
 	handled, err := chain.RunRecursiveHandlers(ic, prog, w, r)
 	if handled {

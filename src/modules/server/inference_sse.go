@@ -163,7 +163,11 @@ func (m *InferenceSseModule) ServeHTTP(w http.ResponseWriter, r *http.Request, n
 		return nil
 	}
 
-	traceID := uuid.New().String()
+	// Preserve trace ID across InferFresh re-entries; generate only if absent.
+	traceID, _ := r.Context().Value(plugin.ContextTraceID()).(string)
+	if traceID == "" {
+		traceID = uuid.New().String()
+	}
 	ctx := r.Context()
 	ctx = context.WithValue(ctx, plugin.ContextTraceID(), traceID)
 	ctx = context.WithValue(ctx, plugin.ContextClientStyleKey(), m.clientStyle)
@@ -179,11 +183,11 @@ func (m *InferenceSseModule) ServeHTTP(w http.ResponseWriter, r *http.Request, n
 		Infer: func(p *ail.Program, w http.ResponseWriter, req *http.Request) error {
 			return RunInferencePipeline(router, chain, p, w, req, m, m.logger)
 		},
-		// InferFresh re-enters ServeHTTP with recursion bypass for different-model
-		// sub-inferences (e.g. sub-agent stripping its plugin suffix).
+		// InferFresh re-enters ServeHTTP with fresh plugin resolution.
+		// Each RecursiveHandlerPlugin is responsible for its own re-entry
+		// prevention via per-plugin context guards.
 		InferFresh: func(p *ail.Program, w http.ResponseWriter, req *http.Request) error {
-			freshR := req.WithContext(plugin.WithRecursionBypass(req.Context()))
-			freshR = freshR.WithContext(ail.ContextWithProgram(freshR.Context(), p))
+			freshR := req.WithContext(ail.ContextWithProgram(req.Context(), p))
 			return m.ServeHTTP(w, freshR, nil)
 		},
 		// ParseCapture handles both SSE and non-streaming response formats.
@@ -191,6 +195,7 @@ func (m *InferenceSseModule) ServeHTTP(w http.ResponseWriter, r *http.Request, n
 			streamParser, _ := ail.GetStreamChunkParser(m.clientStyle)
 			return plugin.ParseCapturedResponse(cap, m.respParser, streamParser)
 		},
+		Chain: chain,
 	}
 
 	// Check if any recursive handler plugin wants to handle this request.

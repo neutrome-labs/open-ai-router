@@ -32,15 +32,20 @@ type InferenceContext struct {
 	Infer InferFunc
 
 	// InferFresh re-enters the full handler (ServeHTTP) with fresh plugin
-	// resolution for a different model. Recursive handlers are automatically
-	// bypassed on re-entry via a framework-level context guard.
-	// Use when the model changes (e.g., sub-agent stripping its suffix).
+	// resolution for a different model. Recursive handlers fire normally
+	// in the fresh chain — each plugin is responsible for its own
+	// re-entry prevention via per-plugin context guards.
 	InferFresh InferFunc
 
 	// ParseCapture parses raw captured response bytes into an AIL program.
 	// Handles both SSE (text/event-stream) and non-streaming formats by
 	// inspecting the Content-Type header from the capture.
 	ParseCapture func(capture *services.ResponseCaptureWriter) (*ail.Program, error)
+
+	// Chain is the current plugin chain. Plugins can inspect it to
+	// discover other plugin instances (e.g., chain plugin collecting
+	// all chain steps).
+	Chain *PluginChain
 }
 
 // Capture runs inference, captures the raw response, and parses it to AIL.
@@ -120,26 +125,6 @@ func parseSSECapture(data []byte, parser ail.StreamChunkParser) (*ail.Program, e
 	// into full message opcodes (TXT_CHUNK, CALL_START/CALL_END, etc.)
 	// so that ToolCalls() and Messages() work correctly on the result.
 	return ail.ReassembleStream(result), nil
-}
-
-// ─── recursionBypassKey ─────────────────────────────────────────────────────
-
-// recursionBypassKey is a framework-level context key that tells
-// RunRecursiveHandlers to skip all recursive handler plugins.
-// Set by InferFresh so that re-entering ServeHTTP for a different
-// model doesn't trigger recursive handlers again.
-type recursionBypassKey struct{}
-
-// WithRecursionBypass returns a context that causes RunRecursiveHandlers
-// to return handled=false immediately. Used by InferFresh.
-func WithRecursionBypass(ctx context.Context) context.Context {
-	return context.WithValue(ctx, recursionBypassKey{}, true)
-}
-
-// HasRecursionBypass checks whether the recursion bypass is set.
-func HasRecursionBypass(ctx context.Context) bool {
-	_, ok := ctx.Value(recursionBypassKey{}).(bool)
-	return ok
 }
 
 // Logger for plugin chain - can be set by modules
@@ -277,4 +262,30 @@ func ClientStyleFromContext(ctx context.Context) ail.Style {
 		return v
 	}
 	return ail.StyleChatCompletions
+}
+
+// ─── Sampler step context ───────────────────────────────────────────────────
+
+// samplerStepCtxKey carries the current sub-step index so the sampler
+// can namespace files per step (e.g. request.up.0.ail, response.1.ail).
+// Recursive handler plugins (chain, subagent, etc.) set this before each
+// capture call.
+type samplerStepCtxKey struct{}
+
+// SamplerStep holds step metadata for the sampler.
+type SamplerStep struct {
+	Index int    // 0-based step index within the recursive handler
+	Label string // human-readable label (e.g. "chain:translate to Greek")
+	Total int    // total number of steps (0 = unknown)
+}
+
+// WithSamplerStep returns a context with the given sampler step.
+func WithSamplerStep(ctx context.Context, step SamplerStep) context.Context {
+	return context.WithValue(ctx, samplerStepCtxKey{}, step)
+}
+
+// SamplerStepFromContext extracts the sampler step, if set.
+func SamplerStepFromContext(ctx context.Context) (SamplerStep, bool) {
+	v, ok := ctx.Value(samplerStepCtxKey{}).(SamplerStep)
+	return v, ok
 }

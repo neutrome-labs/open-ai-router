@@ -16,13 +16,11 @@ import (
 var APP_VERSION = "5.0.0"
 
 func init() {
-	services.TryInstrumentAppObservability()
-
 	plugin.RegisterPlugin("tiktoken", plugins.NewTiktoken())
 	plugin.RegisterPlugin("fuzz", &flow.Fuzz{})
 	plugin.RegisterPlugin("slwin", &plugins.SlidingWindow{})
 	plugin.RegisterPlugin("kvtools", plugins.NewKvTools())
-	plugin.RegisterPlugin("subagent", plugins.NewSubAgent())
+	plugin.RegisterPlugin("chain", &plugins.ChainPlugin{})
 	plugin.RegisterPlugin("dspy", &dspy.DSPy{})
 
 	// Auto-enable the sampler when the SAMPLER env var points to a directory.

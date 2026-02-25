@@ -140,15 +140,9 @@ func (c *PluginChain) RunRequestInit(r *http.Request, prog *ail.Program) {
 }
 
 // RunRecursiveHandlers executes all RecursiveHandlerPlugin implementations.
-// Skips all plugins if the framework-level recursion bypass is set (InferFresh path).
+// Each plugin is responsible for its own re-entry prevention via per-plugin
+// context guards (e.g., chain plugin sets chainBypassKey).
 func (c *PluginChain) RunRecursiveHandlers(ic *InferenceContext, prog *ail.Program, w http.ResponseWriter, r *http.Request) (bool, error) {
-	// Framework-level bypass: InferFresh sets this to prevent recursive
-	// handlers from firing when re-entering ServeHTTP for a different model.
-	if HasRecursionBypass(r.Context()) {
-		Logger.Debug("RunRecursiveHandlers bypassed (InferFresh re-entry)")
-		return false, nil
-	}
-
 	Logger.Debug("RunRecursiveHandlers starting", zap.Int("plugin_count", len(c.plugins)))
 	for _, pi := range c.plugins {
 		if rh, ok := pi.Plugin.(RecursiveHandlerPlugin); ok {

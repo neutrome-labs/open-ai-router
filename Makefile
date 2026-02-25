@@ -28,7 +28,7 @@ coverage:
 	@echo "Coverage report: coverage.html"
 
 dspy-sidecar-install:
-	pip3 install -r sidecar/requirements.txt
+	pip3 install -r sidecar/dspy/requirements.txt
 
 dspy-sidecar:
-	python3 sidecar/dspy_sidecar.py
+	python3 sidecar/dspy/main.py
