@@ -3,13 +3,144 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/neutrome-labs/ail"
 	"github.com/neutrome-labs/open-ai-router/src/services"
+	"github.com/neutrome-labs/open-ai-router/src/sse"
 	"go.uber.org/zap"
 )
+
+// ─── Inference function types ───────────────────────────────────────────────
+
+// InferFunc runs a single inference round through the provider pipeline.
+// Plugins call it with a ResponseCaptureWriter to capture intermediate
+// results, or the real http.ResponseWriter to stream directly to the client.
+type InferFunc func(prog *ail.Program, w http.ResponseWriter, r *http.Request) error
+
+// InferenceContext bundles inference capabilities for recursive handler plugins.
+// Created by the endpoint module and passed to RecursiveHandler — replaces
+// the old HandlerInvoker interface with simple function pointers + convenience methods.
+type InferenceContext struct {
+	// Infer runs inference through the current plugin chain
+	// (Before → provider → After). Does NOT re-enter recursive handlers
+	// or re-run RequestPreamble. Use for tool dispatch loops where the
+	// model and plugin chain don't change between rounds.
+	Infer InferFunc
+
+	// InferFresh re-enters the full handler (ServeHTTP) with fresh plugin
+	// resolution for a different model. Recursive handlers are automatically
+	// bypassed on re-entry via a framework-level context guard.
+	// Use when the model changes (e.g., sub-agent stripping its suffix).
+	InferFresh InferFunc
+
+	// ParseCapture parses raw captured response bytes into an AIL program.
+	// Handles both SSE (text/event-stream) and non-streaming formats by
+	// inspecting the Content-Type header from the capture.
+	ParseCapture func(capture *services.ResponseCaptureWriter) (*ail.Program, error)
+}
+
+// Capture runs inference, captures the raw response, and parses it to AIL.
+// Returns both the parsed program and the raw capture (for replay).
+func (ic *InferenceContext) Capture(prog *ail.Program, r *http.Request) (*ail.Program, *services.ResponseCaptureWriter, error) {
+	cap := &services.ResponseCaptureWriter{}
+	if err := ic.Infer(prog, cap, r); err != nil {
+		return nil, cap, err
+	}
+	parsed, err := ic.ParseCapture(cap)
+	return parsed, cap, err
+}
+
+// CaptureFresh runs inference through the full handler (fresh plugin resolution)
+// and captures + parses the response. Use when the model changed.
+func (ic *InferenceContext) CaptureFresh(prog *ail.Program, r *http.Request) (*ail.Program, *services.ResponseCaptureWriter, error) {
+	cap := &services.ResponseCaptureWriter{}
+	if err := ic.InferFresh(prog, cap, r); err != nil {
+		return nil, cap, err
+	}
+	parsed, err := ic.ParseCapture(cap)
+	return parsed, cap, err
+}
+
+// ReplayCapture writes a previously captured response (headers + body)
+// to the real client writer.
+func ReplayCapture(capture *services.ResponseCaptureWriter, w http.ResponseWriter) {
+	for k, vs := range capture.Headers {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.Write(capture.Response)
+}
+
+// ParseCapturedResponse parses raw captured response bytes into an AIL program.
+// Auto-detects SSE (text/event-stream) vs non-streaming by inspecting the
+// Content-Type header. For SSE, each event is parsed with the StreamChunkParser
+// and then reassembled into a full-message program (STREAM_* → MSG/CALL/TXT).
+// Used by endpoint modules to build the ParseCapture closure for InferenceContext.
+func ParseCapturedResponse(capture *services.ResponseCaptureWriter, respParser ResponseParser, streamParser ail.StreamChunkParser) (*ail.Program, error) {
+	if len(capture.Response) == 0 {
+		return ail.NewProgram(), nil
+	}
+	ct := ""
+	if capture.Headers != nil {
+		ct = capture.Headers.Get("Content-Type")
+	}
+	if strings.HasPrefix(ct, "text/event-stream") {
+		return parseSSECapture(capture.Response, streamParser)
+	}
+	return respParser.ParseResponse(capture.Response)
+}
+
+// parseSSECapture reads captured SSE bytes, parses each chunk with StreamChunkParser,
+// and reassembles the accumulated streaming opcodes into a full-message program.
+func parseSSECapture(data []byte, parser ail.StreamChunkParser) (*ail.Program, error) {
+	reader := sse.NewDefaultReader(bytes.NewReader(data))
+	events := reader.ReadEvents()
+
+	result := ail.NewProgram()
+	for ev := range events {
+		if ev.Done || ev.Error != nil {
+			break
+		}
+		if len(ev.Data) == 0 {
+			continue
+		}
+		chunk, err := parser.ParseStreamChunk(ev.Data)
+		if err != nil {
+			// Skip unparseable chunks (e.g. heartbeats, metadata)
+			continue
+		}
+		result = result.Append(chunk)
+	}
+	// Convert streaming opcodes (STREAM_DELTA, STREAM_TOOL_DELTA, etc.)
+	// into full message opcodes (TXT_CHUNK, CALL_START/CALL_END, etc.)
+	// so that ToolCalls() and Messages() work correctly on the result.
+	return ail.ReassembleStream(result), nil
+}
+
+// ─── recursionBypassKey ─────────────────────────────────────────────────────
+
+// recursionBypassKey is a framework-level context key that tells
+// RunRecursiveHandlers to skip all recursive handler plugins.
+// Set by InferFresh so that re-entering ServeHTTP for a different
+// model doesn't trigger recursive handlers again.
+type recursionBypassKey struct{}
+
+// WithRecursionBypass returns a context that causes RunRecursiveHandlers
+// to return handled=false immediately. Used by InferFresh.
+func WithRecursionBypass(ctx context.Context) context.Context {
+	return context.WithValue(ctx, recursionBypassKey{}, true)
+}
+
+// HasRecursionBypass checks whether the recursion bypass is set.
+func HasRecursionBypass(ctx context.Context) bool {
+	_, ok := ctx.Value(recursionBypassKey{}).(bool)
+	return ok
+}
 
 // Logger for plugin chain - can be set by modules
 var Logger *zap.Logger = zap.NewNop()
@@ -95,52 +226,23 @@ type ErrorPlugin interface {
 	OnError(params string, p *services.ProviderService, r *http.Request, reqProg *ail.Program, res *http.Response, providerErr error) error
 }
 
-// HandlerInvoker allows plugins to invoke the outer handler recursively.
-// Used by plugins like fallback (retry with different providers) and parallel (fan-out).
-type HandlerInvoker interface {
-	// InvokeHandler invokes the outer handler with the given AIL program.
-	InvokeHandler(prog *ail.Program, w http.ResponseWriter, r *http.Request) error
-
-	// InvokeHandlerCapture invokes the handler and captures the response as an AIL program.
-	InvokeHandlerCapture(prog *ail.Program, r *http.Request) (*ail.Program, error)
-
-	// InvokeHandlerCaptureStream invokes the handler with streaming enabled,
-	// captures all SSE chunks internally, and returns the assembled AIL program.
-	// Used by ToolPlugin for intermediate tool-dispatch rounds on streaming
-	// requests: the response is buffered so tool calls can be detected and
-	// handled, without streaming partial results to the real client.
-	InvokeHandlerCaptureStream(prog *ail.Program, r *http.Request) (*ail.Program, error)
-
-	// ParseCapturedResponse parses raw bytes from a ResponseCaptureWriter
-	// into an AIL program. Inspects the Content-Type header to determine
-	// the wire format (SSE text/event-stream vs non-streaming JSON/AIL).
-	// Used by ToolPlugin to parse captured responses regardless of the
-	// underlying module format.
-	ParseCapturedResponse(capture *services.ResponseCaptureWriter) (*ail.Program, error)
-}
-
 // ResponseParser converts raw captured response bytes into an AIL program.
-// Injected into CaddyModuleInvoker so the invoker is not coupled to any
-// particular wire format (ChatCompletions JSON, AIL binary, etc.).
+// Used by InferenceContext.ParseCapture to decode wire-format responses
+// (ChatCompletions JSON, AIL binary, etc.) back into AIL programs.
 type ResponseParser interface {
 	ParseResponse(data []byte) (*ail.Program, error)
 }
 
-// StreamResponseParser converts captured SSE response bytes into an AIL program.
-// Used by InvokeHandlerCaptureStream to reassemble a streamed response.
-type StreamResponseParser interface {
-	ParseStreamResponse(data []byte) (*ail.Program, error)
-}
-
-// RecursiveHandlerPlugin can intercept the request flow and invoke the handler recursively.
-// Used for plugins that need to make multiple calls (fallback, parallel, etc.).
+// RecursiveHandlerPlugin can intercept the request flow and run inference
+// rounds via the InferenceContext. Used for plugins that need multiple
+// inference calls (tool dispatch, fallback, parallel, etc.).
 type RecursiveHandlerPlugin interface {
 	Plugin
 	// RecursiveHandler is called before normal provider iteration.
-	// If handled is true, the plugin has handled the request.
+	// If handled is true, the plugin has written the response.
 	RecursiveHandler(
 		params string,
-		invoker HandlerInvoker,
+		ic *InferenceContext,
 		prog *ail.Program,
 		w http.ResponseWriter,
 		r *http.Request,

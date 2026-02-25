@@ -1,7 +1,6 @@
 package plugin
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 
@@ -36,10 +35,10 @@ type ToolCallContext struct {
 	// RequestProg is the original (pre-tool-injection) request AIL program.
 	RequestProg *ail.Program
 
-	// Invoker allows tool handlers to perform sub-inference calls.
-	// Available only when triggered via RecursiveHandler (i.e. always
-	// during normal ToolPlugin orchestration).
-	Invoker HandlerInvoker
+	// Infer provides inference capabilities for sub-calls.
+	// Use Infer.Capture() for same-model re-inference,
+	// or Infer.CaptureFresh() when the model changes (e.g. sub-agent).
+	Infer *InferenceContext
 
 	// Request is the original HTTP request. Useful for extracting
 	// context values (auth, headers, etc.) in sub-inference calls.
@@ -84,18 +83,15 @@ func (tp *ToolPlugin) Before(params string, _ *services.ProviderService, _ *http
 	return injectDefs(prog, defs), nil
 }
 
-// toolRecursionGuard is a context key to prevent re-entrant RecursiveHandler calls.
-// When ToolPlugin calls InvokeHandler internally, the inner ServeHTTP would
-// call RunRecursiveHandlers again. The guard makes the plugin return
-// handled=false on re-entry so the inner pipeline runs normally.
-type toolRecursionGuard struct{}
-
 // RecursiveHandler intercepts the request flow to handle local tool calls —
 // satisfies RecursiveHandlerPlugin.
 //
-// Captures the provider response (SSE for streaming, JSON/AIL for non-streaming),
-// detects tool calls that match this handler's registered tools, dispatches them
-// locally, appends the results, and re-invokes inference — repeating up to MaxRounds.
+// Captures the provider response via ic.Capture(), detects tool calls that
+// match this handler's registered tools, dispatches them locally, appends
+// the results, and re-invokes inference — repeating up to MaxRounds.
+//
+// No recursion guard is needed: ic.Infer calls RunInferencePipeline directly
+// (skipping RunRecursiveHandlers), so this method is never re-entered.
 //
 // Only in-router tools (those from ToolDefs) are intercepted. Client-provided
 // tools pass through transparently — the captured response is replayed to the
@@ -107,18 +103,11 @@ type toolRecursionGuard struct{}
 // of the final response.
 func (tp *ToolPlugin) RecursiveHandler(
 	params string,
-	invoker HandlerInvoker,
+	ic *InferenceContext,
 	prog *ail.Program,
 	w http.ResponseWriter,
 	r *http.Request,
 ) (bool, error) {
-	// Recursion guard: skip if we're already inside a ToolPlugin invocation.
-	// The inner pipeline will proceed with normal (non-recursive) flow,
-	// which includes BeforePlugin (tool def injection) → inference → AfterPlugin.
-	if r.Context().Value(toolRecursionGuard{}) != nil {
-		return false, nil
-	}
-
 	maxRounds := tp.MaxRounds
 	if maxRounds <= 0 {
 		maxRounds = 10
@@ -133,28 +122,15 @@ func (tp *ToolPlugin) RecursiveHandler(
 	ctx := &ToolCallContext{
 		TraceID:     traceID,
 		RequestProg: prog,
-		Invoker:     invoker,
+		Infer:       ic,
 		Request:     r,
 	}
 
-	// Set recursion guard so inner InvokeHandler calls don't re-enter.
-	guardR := r.WithContext(context.WithValue(r.Context(), toolRecursionGuard{}, true))
-
-	// First round: invoke the normal pipeline and capture the raw response.
-	// For streaming requests this captures the full SSE byte stream;
-	// for non-streaming it captures the JSON/AIL response body.
-	capture := &services.ResponseCaptureWriter{}
-	if err := invoker.InvokeHandler(prog, capture, guardR); err != nil {
+	// First round: invoke the pipeline and capture the raw response.
+	resProg, capture, err := ic.Capture(prog, r)
+	if err != nil {
 		// Pipeline failed — don't handle, let the caller deal with it.
 		return false, nil
-	}
-
-	// Parse captured response into AIL (format-agnostic via invoker).
-	resProg, err := invoker.ParseCapturedResponse(capture)
-	if err != nil {
-		// Can't parse — replay raw response as-is.
-		replayCapture(capture, w)
-		return true, nil
 	}
 
 	// Check if the response has any calls to our tools.
@@ -162,7 +138,7 @@ func (tp *ToolPlugin) RecursiveHandler(
 	if nHandled == 0 {
 		// No tool calls for us — replay the captured response.
 		// Client-provided tool calls (if any) pass through to the client.
-		replayCapture(capture, w)
+		ReplayCapture(capture, w)
 		return true, nil
 	}
 
@@ -185,15 +161,9 @@ func (tp *ToolPlugin) RecursiveHandler(
 			zap.String("tool", tp.Handler.ToolName()),
 			zap.Int("round", round))
 
-		capture = &services.ResponseCaptureWriter{}
-		if err := invoker.InvokeHandler(currentProg, capture, guardR); err != nil {
-			return true, err
-		}
-
-		resProg, err = invoker.ParseCapturedResponse(capture)
+		resProg, capture, err = ic.Capture(currentProg, r)
 		if err != nil {
-			replayCapture(capture, w)
-			return true, nil
+			return true, err
 		}
 
 		resultInsts, nHandled = tp.dispatchCalls(params, resProg, ctx)
@@ -201,7 +171,7 @@ func (tp *ToolPlugin) RecursiveHandler(
 			// Model finished — replay final response to client.
 			// For streaming: the captured SSE bytes are replayed, producing
 			// a valid SSE stream (delayed first byte, but complete).
-			replayCapture(capture, w)
+			ReplayCapture(capture, w)
 			return true, nil
 		}
 
@@ -216,18 +186,8 @@ func (tp *ToolPlugin) RecursiveHandler(
 	Logger.Warn("ToolPlugin max rounds exhausted",
 		zap.String("tool", tp.Handler.ToolName()),
 		zap.Int("max_rounds", maxRounds))
-	replayCapture(capture, w)
+	ReplayCapture(capture, w)
 	return true, nil
-}
-
-// replayCapture writes a captured response (headers + body) to the real writer.
-func replayCapture(capture *services.ResponseCaptureWriter, w http.ResponseWriter) {
-	for k, vs := range capture.Headers {
-		for _, v := range vs {
-			w.Header().Add(k, v)
-		}
-	}
-	w.Write(capture.Response)
 }
 
 // dispatchCalls checks a response program for tool calls matching our handler

@@ -140,12 +140,20 @@ func (c *PluginChain) RunRequestInit(r *http.Request, prog *ail.Program) {
 }
 
 // RunRecursiveHandlers executes all RecursiveHandlerPlugin implementations.
-func (c *PluginChain) RunRecursiveHandlers(invoker HandlerInvoker, prog *ail.Program, w http.ResponseWriter, r *http.Request) (bool, error) {
+// Skips all plugins if the framework-level recursion bypass is set (InferFresh path).
+func (c *PluginChain) RunRecursiveHandlers(ic *InferenceContext, prog *ail.Program, w http.ResponseWriter, r *http.Request) (bool, error) {
+	// Framework-level bypass: InferFresh sets this to prevent recursive
+	// handlers from firing when re-entering ServeHTTP for a different model.
+	if HasRecursionBypass(r.Context()) {
+		Logger.Debug("RunRecursiveHandlers bypassed (InferFresh re-entry)")
+		return false, nil
+	}
+
 	Logger.Debug("RunRecursiveHandlers starting", zap.Int("plugin_count", len(c.plugins)))
 	for _, pi := range c.plugins {
 		if rh, ok := pi.Plugin.(RecursiveHandlerPlugin); ok {
 			Logger.Debug("Running RecursiveHandler plugin", zap.String("plugin", pi.Plugin.Name()), zap.String("params", pi.Params))
-			handled, err := rh.RecursiveHandler(pi.Params, invoker, prog, w, r)
+			handled, err := rh.RecursiveHandler(pi.Params, ic, prog, w, r)
 			if handled {
 				if err != nil {
 					Logger.Debug("RecursiveHandler plugin handled with error", zap.String("plugin", pi.Plugin.Name()), zap.Error(err))

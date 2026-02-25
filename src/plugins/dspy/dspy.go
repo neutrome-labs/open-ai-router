@@ -68,7 +68,7 @@ type dspyRecursionGuard struct{}
 
 func (d *DSPy) RecursiveHandler(
 	params string,
-	invoker plugin.HandlerInvoker,
+	ic *plugin.InferenceContext,
 	prog *ail.Program,
 	w http.ResponseWriter,
 	r *http.Request,

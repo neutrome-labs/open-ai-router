@@ -14,7 +14,7 @@ import (
 
 // SubAgent is a tool plugin that injects a "run_in_subagent" tool definition
 // into the request. When the LLM calls this tool, SubAgent spawns a full
-// sub-inference call (via HandlerInvoker) with the given task, captures
+// sub-inference call (via InferenceContext) with the given task, captures
 // the response, and returns a textual summary back to the calling model.
 //
 // This lets the model branch out heavy or specialised work to a separate
@@ -97,8 +97,8 @@ func (s *SubAgent) HandleToolCall(
 		return "task is required", true, nil
 	}
 
-	if ctx == nil || ctx.Invoker == nil || ctx.Request == nil {
-		return "subagent: invoker not available in this context", true, nil
+	if ctx == nil || ctx.Infer == nil || ctx.Request == nil {
+		return "subagent: inference context not available", true, nil
 	}
 
 	// ── Depth guard ──────────────────────────────────────────────────────
@@ -143,10 +143,11 @@ func (s *SubAgent) HandleToolCall(
 
 	// ── Invoke sub-inference ─────────────────────────────────────────────
 	// Clone the request and bump the depth counter so nested subagent
-	// calls are tracked.
+	// calls are tracked. Use CaptureFresh since the model changed
+	// (stripped +subagent suffix → needs fresh plugin resolution).
 	subReq := ctx.Request.Clone(withDepth(ctx.Request.Context(), currentDepth+1))
 
-	resProg, err := ctx.Invoker.InvokeHandlerCapture(subProg, subReq)
+	resProg, _, err := ctx.Infer.CaptureFresh(subProg, subReq)
 	if err != nil {
 		plugin.Logger.Error("subagent: sub-inference failed",
 			zap.String("call_id", callID),

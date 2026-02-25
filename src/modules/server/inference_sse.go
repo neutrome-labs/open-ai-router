@@ -15,6 +15,7 @@ import (
 	"github.com/neutrome-labs/open-ai-router/src/drivers/virtual"
 	"github.com/neutrome-labs/open-ai-router/src/modules"
 	"github.com/neutrome-labs/open-ai-router/src/plugin"
+	"github.com/neutrome-labs/open-ai-router/src/services"
 	"github.com/neutrome-labs/open-ai-router/src/sse"
 	"github.com/neutrome-labs/open-ai-router/src/styles"
 	"go.uber.org/zap"
@@ -42,7 +43,7 @@ type InferenceSseModule struct {
 	clientStyle ail.Style
 	reqParser   ail.Parser
 	respEmitter ail.ResponseEmitter
-	respParser  ail.ResponseParser // used by CaddyModuleInvoker for capture parsing
+	respParser  ail.ResponseParser // used by InferenceContext.ParseCapture
 	logger      *zap.Logger
 }
 
@@ -171,11 +172,29 @@ func (m *InferenceSseModule) ServeHTTP(w http.ResponseWriter, r *http.Request, n
 	// Notify plugins of the initial parsed request (e.g., sampler).
 	chain.RunRequestInit(r, prog)
 
-	// The invoker captures responses in the client format and parses them back to AIL.
-	invoker := plugin.NewCaddyModuleInvoker(m, m.respParser)
+	// Build InferenceContext: function pointers for recursive handler plugins.
+	ic := &plugin.InferenceContext{
+		// Infer calls RunInferencePipeline directly — skips RequestPreamble
+		// and RunRecursiveHandlers. Used for same-model tool dispatch loops.
+		Infer: func(p *ail.Program, w http.ResponseWriter, req *http.Request) error {
+			return RunInferencePipeline(router, chain, p, w, req, m, m.logger)
+		},
+		// InferFresh re-enters ServeHTTP with recursion bypass for different-model
+		// sub-inferences (e.g. sub-agent stripping its plugin suffix).
+		InferFresh: func(p *ail.Program, w http.ResponseWriter, req *http.Request) error {
+			freshR := req.WithContext(plugin.WithRecursionBypass(req.Context()))
+			freshR = freshR.WithContext(ail.ContextWithProgram(freshR.Context(), p))
+			return m.ServeHTTP(w, freshR, nil)
+		},
+		// ParseCapture handles both SSE and non-streaming response formats.
+		ParseCapture: func(cap *services.ResponseCaptureWriter) (*ail.Program, error) {
+			streamParser, _ := ail.GetStreamChunkParser(m.clientStyle)
+			return plugin.ParseCapturedResponse(cap, m.respParser, streamParser)
+		},
+	}
 
 	// Check if any recursive handler plugin wants to handle this request.
-	handled, err := chain.RunRecursiveHandlers(invoker, prog, w, r)
+	handled, err := chain.RunRecursiveHandlers(ic, prog, w, r)
 	if handled {
 		if err != nil {
 			m.logger.Error("recursive handler plugin failed", zap.Error(err))

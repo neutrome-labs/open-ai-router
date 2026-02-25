@@ -17,6 +17,7 @@ import (
 	"github.com/neutrome-labs/open-ai-router/src/drivers/virtual"
 	"github.com/neutrome-labs/open-ai-router/src/modules"
 	"github.com/neutrome-labs/open-ai-router/src/plugin"
+	"github.com/neutrome-labs/open-ai-router/src/services"
 	"github.com/neutrome-labs/open-ai-router/src/sse"
 	"go.uber.org/zap"
 )
@@ -172,9 +173,22 @@ func (m *InferenceAILModule) ServeHTTP(w http.ResponseWriter, r *http.Request, n
 	// Notify plugins of the initial parsed request (e.g., sampler).
 	chain.RunRequestInit(r, prog)
 
-	// Recursive handler plugins (tool dispatch, fallback, parallel, etc.).
-	invoker := plugin.NewCaddyModuleInvoker(m, &ailResponseParser{})
-	handled, err := chain.RunRecursiveHandlers(invoker, prog, w, r)
+	// Build InferenceContext for recursive handler plugins.
+	ailParser := &ailResponseParser{}
+	ic := &plugin.InferenceContext{
+		Infer: func(p *ail.Program, w http.ResponseWriter, req *http.Request) error {
+			return RunInferencePipeline(router, chain, p, w, req, m, m.logger)
+		},
+		InferFresh: func(p *ail.Program, w http.ResponseWriter, req *http.Request) error {
+			freshR := req.WithContext(plugin.WithRecursionBypass(req.Context()))
+			freshR = freshR.WithContext(ail.ContextWithProgram(freshR.Context(), p))
+			return m.ServeHTTP(w, freshR, nil)
+		},
+		ParseCapture: func(cap *services.ResponseCaptureWriter) (*ail.Program, error) {
+			return plugin.ParseCapturedResponse(cap, ailParser, ailParser)
+		},
+	}
+	handled, err := chain.RunRecursiveHandlers(ic, prog, w, r)
 	if handled {
 		if err != nil {
 			m.logger.Error("recursive handler plugin failed", zap.Error(err))
@@ -361,9 +375,10 @@ func (m *InferenceAILModule) wantBinaryOutput(r *http.Request, inputBinary bool)
 
 // ─── AIL Response Parser ─────────────────────────────────────────────────────
 
-// ailResponseParser implements plugin.ResponseParser for the AIL wire format.
-// Auto-detects binary AIL (magic header) vs text (disassembly) and parses accordingly.
-// Used by CaddyModuleInvoker when the AIL module is invoked recursively.
+// ailResponseParser implements plugin.ResponseParser and ail.StreamChunkParser
+// for the AIL wire format. Auto-detects binary AIL (magic header) vs text
+// (disassembly) and parses accordingly.
+// Used by InferenceContext.ParseCapture when the AIL module is invoked recursively.
 type ailResponseParser struct{}
 
 func (p *ailResponseParser) ParseResponse(data []byte) (*ail.Program, error) {
@@ -375,9 +390,16 @@ func (p *ailResponseParser) ParseResponse(data []byte) (*ail.Program, error) {
 	return ail.Asm(string(data))
 }
 
+// ParseStreamChunk for AIL is the same as ParseResponse — AIL natively
+// represents both streaming and non-streaming opcodes.
+func (p *ailResponseParser) ParseStreamChunk(data []byte) (*ail.Program, error) {
+	return p.ParseResponse(data)
+}
+
 var (
 	_ caddy.Provisioner           = (*InferenceAILModule)(nil)
 	_ caddyhttp.MiddlewareHandler = (*InferenceAILModule)(nil)
 	_ InferenceHandler            = (*InferenceAILModule)(nil)
 	_ plugin.ResponseParser       = (*ailResponseParser)(nil)
+	_ ail.StreamChunkParser       = (*ailResponseParser)(nil)
 )
