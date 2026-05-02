@@ -9,3 +9,4 @@ samples/
 
 caddy
 Caddyfile
+dist/

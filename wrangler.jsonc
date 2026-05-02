@@ -1,0 +1,17 @@
+{
+  "name": "open-ai-router",
+  "main": "worker.js",
+  "compatibility_date": "2026-04-24",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "assets": {
+		"directory": "./assets",
+		"binding": "ASSETS"
+	},
+  "observability": {
+    "logs": {
+      "enabled": true
+    }
+  }
+}
